@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gm4",
+  "compatibility_date": "2026-04-16",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "."
+  },
+  "routes": [
+    {
+      "pattern": "erd.mmec.ca/gm4/*",
+      "zone_name": "mmec.ca"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
