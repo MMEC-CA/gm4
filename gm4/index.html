@@ -3,9 +3,22 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>gm4</title>
+    <title>Multiplayer Racing Game - gm4</title>
+    <style>
+      body { margin: 0; font-family: Arial, sans-serif; background: #000; color: #fff; }
+      #gameCanvas { display: block; background: #111; }
+      #ui { position: absolute; top: 10px; left: 10px; }
+      #roomInput { margin-bottom: 10px; }
+      #status { margin-top: 10px; }
+    </style>
   </head>
   <body>
-    <p>gm4</p>
+    <div id="ui">
+      <input type="text" id="roomInput" placeholder="Room code (optional)" />
+      <button id="joinBtn">Join Game</button>
+      <div id="status">Not connected</div>
+    </div>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <script src="game.js"></script>
   </body>
 </html>
