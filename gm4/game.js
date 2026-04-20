@@ -42,6 +42,13 @@ let countdownTimer = COUNTDOWN_DURATION;
 let holdingFlap = false;
 let holdStartTime = 0;
 
+// Local P2 player (WASD — same device, left side of keyboard)
+let myP2PeerId = myPeerId + '-p2';
+let myP2SlotIndex = -1;
+let holdingFlapP2 = false;
+let holdStartTimeP2 = 0;
+let myCarP2 = null;
+
 // Networking
 let sigWs = null;
 let pcs = new Map();
@@ -59,15 +66,21 @@ let goFlashTimer = 0;
 const keys = {};
 document.addEventListener('keydown', e => {
   keys[e.code] = true;
+  if (e.repeat) return; // ignore key-repeat for lobby hold actions
   if (e.code === 'Space') { e.preventDefault(); onFlapDown(); }
-  if ((e.code === 'ArrowUp' || e.code === 'ArrowDown' ||
-       e.code === 'ArrowLeft' || e.code === 'ArrowRight') && lobbyState === 'game') {
-    e.preventDefault();
+  if (e.code === 'ArrowUp') {
+    if (lobbyState === 'lobby' || lobbyState === 'countdown') { e.preventDefault(); onFlapDown(); }
+    else if (lobbyState === 'game') e.preventDefault();
   }
+  if (e.code === 'ArrowDown' || e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+    if (lobbyState === 'game') e.preventDefault();
+  }
+  if (e.code === 'KeyW' && (lobbyState === 'lobby' || lobbyState === 'countdown')) onFlapDownP2();
 });
 document.addEventListener('keyup', e => {
   keys[e.code] = false;
-  if (e.code === 'Space') onFlapUp();
+  if (e.code === 'Space' || e.code === 'ArrowUp') onFlapUp();
+  if (e.code === 'KeyW') onFlapUpP2();
 });
 
 // Canvas
@@ -98,9 +111,11 @@ function onFlapDown() {
   if (mySlotIndex < 0) claimSlot();
   if (mySlotIndex < 0) return;
   if (slots[mySlotIndex].ready) return;
-  holdingFlap = true;
-  holdStartTime = performance.now();
-  slots[mySlotIndex].holding = true;
+  if (!holdingFlap) {  // don't reset timer if already holding
+    holdingFlap = true;
+    holdStartTime = performance.now();
+    slots[mySlotIndex].holding = true;
+  }
 }
 
 function onFlapUp() {
@@ -113,12 +128,46 @@ function onFlapUp() {
   }
 }
 
+function onFlapDownP2() {
+  if (lobbyState !== 'lobby') return;
+  if (myP2SlotIndex < 0) claimSlotP2();
+  if (myP2SlotIndex < 0) return;
+  if (slots[myP2SlotIndex].ready) return;
+  if (!holdingFlapP2) {
+    holdingFlapP2 = true;
+    holdStartTimeP2 = performance.now();
+    slots[myP2SlotIndex].holding = true;
+  }
+}
+
+function onFlapUpP2() {
+  if (!holdingFlapP2) return;
+  holdingFlapP2 = false;
+  if (myP2SlotIndex >= 0 && !slots[myP2SlotIndex].ready) {
+    slots[myP2SlotIndex].holding = false;
+    slots[myP2SlotIndex].progress = 0;
+    broadcast({ type: 'lobby-release', peerId: myP2PeerId });
+  }
+}
+
 function claimSlot() {
   for (let i = 0; i < MAX_SLOTS; i++) {
     if (!slots[i].peerId) {
       mySlotIndex = i;
       slots[i].peerId = myPeerId;
       broadcast({ type: 'lobby-join', peerId: myPeerId, slotIndex: i });
+      updateHost();
+      return;
+    }
+  }
+}
+
+function claimSlotP2() {
+  for (let i = 0; i < MAX_SLOTS; i++) {
+    if (!slots[i].peerId) {
+      myP2SlotIndex = i;
+      slots[i].peerId = myP2PeerId;
+      broadcast({ type: 'lobby-join', peerId: myP2PeerId, slotIndex: i });
       updateHost();
       return;
     }
@@ -145,6 +194,21 @@ function updateHold(dt) {
     slots[mySlotIndex].holding = false;
     holdingFlap = false;
     broadcast({ type: 'lobby-ready', peerId: myPeerId });
+    checkCountdownStart();
+  }
+}
+
+function updateHoldP2(dt) {
+  if (!holdingFlapP2 || myP2SlotIndex < 0 || slots[myP2SlotIndex].ready) return;
+  const elapsed = (performance.now() - holdStartTimeP2) / 1000;
+  const progress = Math.min(100, (elapsed / HOLD_DURATION) * 100);
+  slots[myP2SlotIndex].progress = progress;
+  broadcast({ type: 'lobby-hold', peerId: myP2PeerId, progress });
+  if (progress >= 100) {
+    slots[myP2SlotIndex].ready = true;
+    slots[myP2SlotIndex].holding = false;
+    holdingFlapP2 = false;
+    broadcast({ type: 'lobby-ready', peerId: myP2PeerId });
     checkCountdownStart();
   }
 }
@@ -260,8 +324,10 @@ function cleanupPeer(peerId) {
   pcs.delete(peerId);
   dcs.delete(peerId);
   remoteCars.delete(peerId);
+  remoteCars.delete(peerId + '-p2'); // clean up their local P2 car too
   for (let i = 0; i < MAX_SLOTS; i++) {
-    if (slots[i].peerId === peerId) {
+    // Remove the peer's P1 and P2 slots
+    if (slots[i].peerId === peerId || slots[i].peerId === peerId + '-p2') {
       slots[i] = { peerId: null, ready: false, progress: 0, holding: false };
     }
   }
@@ -281,7 +347,7 @@ function handleMsg(from, data) {
 
     case 'lobby-sync':
       data.slots.forEach(s => {
-        if (s.peerId && s.peerId !== myPeerId) {
+        if (s.peerId && s.peerId !== myPeerId && s.peerId !== myP2PeerId) {
           slots[s.index].peerId = s.peerId;
           slots[s.index].ready = s.ready;
           slots[s.index].progress = s.progress;
@@ -441,8 +507,11 @@ function startGame(msg) {
   const playerSlots = msg.playerSlots || [];
   const myEntry = playerSlots.find(ps => ps.peerId === myPeerId);
   if (myEntry) {
-    const posIdx = playerSlots.indexOf(myEntry);
-    myCar = makeCar(myEntry.slotIndex, posIdx);
+    myCar = makeCar(myEntry.slotIndex, playerSlots.indexOf(myEntry));
+  }
+  const myP2Entry = playerSlots.find(ps => ps.peerId === myP2PeerId);
+  if (myP2Entry) {
+    myCarP2 = makeCar(myP2Entry.slotIndex, playerSlots.indexOf(myP2Entry));
   }
   // Start race after 3 seconds
   setTimeout(() => {
@@ -457,9 +526,10 @@ function startGame(msg) {
 function updateCar(car, dt) {
   if (car.finished || !raceGo) return;
 
-  if (keys['ArrowUp'] || keys['KeyW']) {
+  // P1 uses Arrow keys only
+  if (keys['ArrowUp']) {
     car.speed = Math.min(car.speed + ACCEL * dt, MAX_SPEED);
-  } else if (keys['ArrowDown'] || keys['KeyS']) {
+  } else if (keys['ArrowDown']) {
     car.speed = Math.max(car.speed - BRAKE * dt, -MAX_SPEED * 0.35);
   } else {
     car.speed *= Math.exp(-FRICTION_K * dt);
@@ -467,8 +537,8 @@ function updateCar(car, dt) {
   }
 
   const grip = Math.abs(car.speed) / MAX_SPEED;
-  if (keys['ArrowLeft'] || keys['KeyA']) car.angle -= TURN_RATE * grip * dt;
-  if (keys['ArrowRight'] || keys['KeyD']) car.angle += TURN_RATE * grip * dt;
+  if (keys['ArrowLeft']) car.angle -= TURN_RATE * grip * dt;
+  if (keys['ArrowRight']) car.angle += TURN_RATE * grip * dt;
 
   car.x += Math.cos(car.angle) * car.speed * dt;
   car.y += Math.sin(car.angle) * car.speed * dt;
@@ -498,6 +568,43 @@ function checkAllFinished() {
   if (finishOrder.length >= totalPlayers) {
     setTimeout(() => { lobbyState = 'finish'; }, 2000);
   }
+}
+
+// P2 car physics — WASD controls
+function updateCarP2(car, dt) {
+  if (car.finished || !raceGo) return;
+
+  if (keys['KeyW']) {
+    car.speed = Math.min(car.speed + ACCEL * dt, MAX_SPEED);
+  } else if (keys['KeyS']) {
+    car.speed = Math.max(car.speed - BRAKE * dt, -MAX_SPEED * 0.35);
+  } else {
+    car.speed *= Math.exp(-FRICTION_K * dt);
+    if (Math.abs(car.speed) < 2) car.speed = 0;
+  }
+
+  const grip = Math.abs(car.speed) / MAX_SPEED;
+  if (keys['KeyA']) car.angle -= TURN_RATE * grip * dt;
+  if (keys['KeyD']) car.angle += TURN_RATE * grip * dt;
+
+  car.x += Math.cos(car.angle) * car.speed * dt;
+  car.y += Math.sin(car.angle) * car.speed * dt;
+  pushToTrack(car);
+
+  const sector = getSector(car.x, car.y);
+  if (sector !== car.prevSector && sector === car.nextSector) {
+    car.sectorsPassed++;
+    car.lap = Math.floor(car.sectorsPassed / 4);
+    car.nextSector = (car.nextSector + 1) % 4;
+    if (car.lap >= TOTAL_LAPS && !car.finished) {
+      car.finished = true;
+      car.finishTime = (performance.now() - raceStartTime) / 1000;
+      finishOrder.push({ peerId: myP2PeerId, time: car.finishTime });
+      broadcast({ type: 'finished', peerId: myP2PeerId, time: car.finishTime });
+      checkAllFinished();
+    }
+  }
+  car.prevSector = sector;
 }
 
 // ============================================================
@@ -659,7 +766,6 @@ function drawLobby(dt) {
       ctx.font = 'bold 14px monospace';
       ctx.fillText('READY!', sx + slotW / 2, sy0 + 66);
     } else if (s.holding) {
-      // Progress bar
       ctx.fillStyle = '#282828';
       ctx.fillRect(sx + 12, sy0 + 60, slotW - 24, 10);
       ctx.fillStyle = col;
@@ -668,9 +774,10 @@ function drawLobby(dt) {
       ctx.font = '10px monospace';
       ctx.fillText('HOLD...', sx + slotW / 2, sy0 + 58);
     } else if (s.peerId) {
-      ctx.fillStyle = s.peerId === myPeerId ? '#aaa' : '#555';
+      const label = s.peerId === myPeerId ? '← P1' : s.peerId === myP2PeerId ? '← P2' : 'joined';
+      ctx.fillStyle = (s.peerId === myPeerId || s.peerId === myP2PeerId) ? '#aaa' : '#555';
       ctx.font = '11px monospace';
-      ctx.fillText(s.peerId === myPeerId ? '← YOU' : 'joined', sx + slotW / 2, sy0 + 68);
+      ctx.fillText(label, sx + slotW / 2, sy0 + 68);
     } else {
       ctx.fillStyle = '#333';
       ctx.font = '12px monospace';
@@ -684,23 +791,23 @@ function drawLobby(dt) {
   if (mySlotIndex < 0) {
     ctx.fillStyle = '#eee';
     ctx.font = 'bold 24px monospace';
-    ctx.fillText('Press SPACE  or  tap to join', GW / 2, inY);
+    ctx.fillText('↑ or SPACE = join as P1  •  W = join as P2', GW / 2, inY);
   } else if (!slots[mySlotIndex]?.ready) {
     ctx.fillStyle = '#eee';
     ctx.font = 'bold 24px monospace';
-    ctx.fillText('Hold SPACE to ready up!', GW / 2, inY);
+    ctx.fillText('Hold ↑ / SPACE to ready (P1)' + (myP2SlotIndex >= 0 ? '  •  Hold W (P2)' : '  •  W = add P2'), GW / 2, inY);
     ctx.fillStyle = '#555';
     ctx.font = '15px monospace';
-    ctx.fillText('(release to cancel)', GW / 2, inY + 28);
+    ctx.fillText('release to cancel', GW / 2, inY + 28);
   } else {
     ctx.fillStyle = '#44ff88';
     ctx.font = 'bold 24px monospace';
-    ctx.fillText('Waiting for others...', GW / 2, inY);
+    ctx.fillText('Waiting for race to start...', GW / 2, inY);
   }
 
   ctx.fillStyle = '#444';
   ctx.font = '15px monospace';
-  ctx.fillText('Arrow keys / WASD to drive  •  Race ' + TOTAL_LAPS + ' laps to win  •  clockwise', GW / 2, inY + 60);
+  ctx.fillText('P1: ↑↓←→  •  P2: WASD  •  Race ' + TOTAL_LAPS + ' laps clockwise', GW / 2, inY + 60);
 
   // Countdown overlay
   if (lobbyState === 'countdown') {
@@ -735,9 +842,12 @@ function drawHUD() {
   ctx.fillStyle = '#aaa';
   ctx.fillText(Math.round(Math.abs(myCar.speed)) + ' px/s', 22, 62);
 
-  // Position
-  const allCars = [...remoteCars.values(), { accAngle: myCar.sectorsPassed, peerId: myPeerId }];
-  allCars.sort((a, b) => (b.sectorsPassed ?? b.accAngle ?? 0) - (a.sectorsPassed ?? a.accAngle ?? 0));
+  // Position (P1 car's rank among all cars)
+  const allCars = [...remoteCars.values(),
+    { sectorsPassed: myCar.sectorsPassed, peerId: myPeerId },
+    ...(myCarP2 ? [{ sectorsPassed: myCarP2.sectorsPassed, peerId: myP2PeerId }] : [])
+  ];
+  allCars.sort((a, b) => (b.sectorsPassed ?? 0) - (a.sectorsPassed ?? 0));
   const pos = allCars.findIndex(c => c.peerId === myPeerId) + 1;
   const sfx = ['st', 'nd', 'rd'];
   const suf = sfx[pos - 1] || 'th';
@@ -793,7 +903,8 @@ function drawFinish() {
   for (const [pid, car] of remoteCars) {
     if (car) drawCar(car, pid.slice(0, 5), false);
   }
-  if (myCar) drawCar(myCar, 'YOU', true);
+  if (myCarP2) drawCar(myCarP2, 'P2', false);
+  if (myCar) drawCar(myCar, 'P1', true);
 
   // Darkened overlay
   ctx.fillStyle = 'rgba(0,0,0,0.72)';
@@ -819,7 +930,7 @@ function drawFinish() {
     const rowY = by + 100 + i * 50;
     const mins = Math.floor(f.time / 60);
     const secs = (f.time % 60).toFixed(2).padStart(5, '0');
-    const name = f.peerId === myPeerId ? 'YOU' : f.peerId.slice(0, 7);
+    const name = f.peerId === myPeerId ? 'P1(you)' : f.peerId === myP2PeerId ? 'P2(you)' : f.peerId.slice(0, 7);
     ctx.fillStyle = i === 0 ? '#ffe030' : '#ccc';
     ctx.font = 'bold 22px monospace';
     ctx.textAlign = 'center';
@@ -844,26 +955,27 @@ function loop(ts) {
 
   if (lobbyState === 'lobby' || lobbyState === 'countdown') {
     updateHold(dt);
+    updateHoldP2(dt);
     updateCountdown(dt);
     drawLobby(dt);
 
   } else if (lobbyState === 'game') {
     if (myCar) {
       updateCar(myCar, dt);
-      // Broadcast local car state at ~30Hz (every other frame is fine too, we broadcast every frame)
       broadcast({
-        type: 'update',
-        peerId: myPeerId,
-        car: {
-          x: myCar.x, y: myCar.y,
-          angle: myCar.angle,
-          speed: myCar.speed,
-          sectorsPassed: myCar.sectorsPassed,
-          lap: myCar.lap,
-          finished: myCar.finished,
-          color: myCar.color,
-          slotIndex: myCar.slotIndex,
-        }
+        type: 'update', peerId: myPeerId,
+        car: { x: myCar.x, y: myCar.y, angle: myCar.angle, speed: myCar.speed,
+               sectorsPassed: myCar.sectorsPassed, lap: myCar.lap,
+               finished: myCar.finished, color: myCar.color, slotIndex: myCar.slotIndex }
+      });
+    }
+    if (myCarP2) {
+      updateCarP2(myCarP2, dt);
+      broadcast({
+        type: 'update', peerId: myP2PeerId,
+        car: { x: myCarP2.x, y: myCarP2.y, angle: myCarP2.angle, speed: myCarP2.speed,
+               sectorsPassed: myCarP2.sectorsPassed, lap: myCarP2.lap,
+               finished: myCarP2.finished, color: myCarP2.color, slotIndex: myCarP2.slotIndex }
       });
     }
 
@@ -871,10 +983,10 @@ function loop(ts) {
     for (const [pid, car] of remoteCars) {
       if (car) drawCar(car, pid.slice(0, 5), false);
     }
-    if (myCar) drawCar(myCar, 'YOU', true);
+    if (myCarP2) drawCar(myCarP2, 'P2', false);
+    if (myCar) drawCar(myCar, 'P1', true);
     drawHUD();
 
-    // All ready players finished → go to finish screen after short delay
     const totalReady = slots.filter(s => s.ready).length;
     if (totalReady > 0 && finishOrder.length >= totalReady) {
       lobbyState = 'finish';
