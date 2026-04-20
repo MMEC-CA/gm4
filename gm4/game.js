@@ -28,6 +28,20 @@ const BRAKE = 800;
 const TURN_RATE = 2.6;   // rad/s at full speed
 const FRICTION_K = 1.8;  // speed decay: speed *= e^(-FRICTION_K * dt)
 
+// Weapons & collisions
+const BULLET_SPEED = 660;
+const BULLET_LIFE = 1.4;   // seconds (travels ~924px)
+const FIRE_RATE = 0.09;    // seconds between shots (~11/s)
+const HIT_RADIUS = 15;     // px, bullet detection range
+const HIT_COOLDOWN = 0.4;  // s invincibility after hit
+const HIT_SPIN = 2.5;      // rad/s spin magnitude from bullet hit
+const HIT_SPEED_MULT = 0.72;
+const HIT_FLASH_DUR = 0.4;
+const SPIN_DECAY = 3.0;    // rad/s² decay rate
+const WALL_BOUNCE = 0.62;  // speed retained on wall bounce
+const CAR_BOUNCE = 0.72;   // speed retained on car-car collision
+const CAR_RADIUS = 16;     // px, collision circle radius per car
+
 // ============================================================
 // STATE
 // ============================================================
@@ -76,6 +90,7 @@ document.addEventListener('keydown', e => {
     if (lobbyState === 'game') e.preventDefault();
   }
   if (e.code === 'KeyW' && (lobbyState === 'lobby' || lobbyState === 'countdown')) onFlapDownP2();
+  if (e.code === 'Tab') e.preventDefault(); // no focus escape during play
 });
 document.addEventListener('keyup', e => {
   keys[e.code] = false;
@@ -410,7 +425,7 @@ function handleMsg(from, data) {
       break;
 
     case 'update':
-      if (data.peerId !== myPeerId) {
+      if (data.peerId !== myPeerId && data.peerId !== myP2PeerId) {
         remoteCars.set(data.peerId, data.car);
       }
       break;
@@ -436,31 +451,56 @@ function getSector(x, y) {
   return 3;                                      // top
 }
 
-function pushToTrack(car) {
-  let dx = car.x - TCX, dy = car.y - TCY;
+function bounceOnWalls(car) {
+  let vx = Math.cos(car.angle) * car.speed;
+  let vy = Math.sin(car.angle) * car.speed;
+  let bounced = false;
 
-  // Outside outer ellipse → push to surface
-  const outerVal = (dx / ORX) ** 2 + (dy / ORY) ** 2;
-  if (outerVal > 1.0) {
+  // Outside outer ellipse — push to surface then reflect
+  let dx = car.x - TCX, dy = car.y - TCY;
+  if ((dx / ORX) ** 2 + (dy / ORY) ** 2 > 1.0) {
     const u = dx / ORX, v = dy / ORY;
     const len = Math.sqrt(u * u + v * v);
     car.x = TCX + (u / len) * ORX;
     car.y = TCY + (v / len) * ORY;
-    car.speed *= 0.25;
     dx = car.x - TCX; dy = car.y - TCY;
+    // Inward normal = -gradient of outer ellipse
+    const nx0 = -dx / (ORX * ORX), ny0 = -dy / (ORY * ORY);
+    const nLen = Math.sqrt(nx0 * nx0 + ny0 * ny0);
+    const nx = nx0 / nLen, ny = ny0 / nLen;
+    const dot = vx * nx + vy * ny;
+    if (dot < 0) {
+      vx -= 2 * dot * nx; vy -= 2 * dot * ny;
+      vx *= WALL_BOUNCE;  vy *= WALL_BOUNCE;
+      car.spinVel += (Math.random() - 0.5) * 2;
+      bounced = true;
+    }
   }
 
-  // Inside inner ellipse → push to surface
-  const innerVal = (dx / IRX) ** 2 + (dy / IRY) ** 2;
-  if (innerVal < 1.0) {
+  // Inside inner ellipse — push to surface then reflect
+  dx = car.x - TCX; dy = car.y - TCY;
+  if ((dx / IRX) ** 2 + (dy / IRY) ** 2 < 1.0) {
     const u = dx / IRX, v = dy / IRY;
     const len = Math.sqrt(u * u + v * v);
-    if (len < 0.001) { car.x = TCX + IRX + 1; car.y = TCY; }
-    else {
-      car.x = TCX + (u / len) * IRX;
-      car.y = TCY + (v / len) * IRY;
+    if (len < 0.001) { car.x = TCX + IRX; car.y = TCY; dx = IRX; dy = 0; }
+    else { car.x = TCX + (u / len) * IRX; car.y = TCY + (v / len) * IRY; }
+    dx = car.x - TCX; dy = car.y - TCY;
+    // Outward normal = +gradient of inner ellipse
+    const nx0 = dx / (IRX * IRX), ny0 = dy / (IRY * IRY);
+    const nLen = Math.sqrt(nx0 * nx0 + ny0 * ny0);
+    const nx = nx0 / nLen, ny = ny0 / nLen;
+    const dot = vx * nx + vy * ny;
+    if (dot < 0) {
+      vx -= 2 * dot * nx; vy -= 2 * dot * ny;
+      vx *= WALL_BOUNCE;  vy *= WALL_BOUNCE;
+      car.spinVel += (Math.random() - 0.5) * 2;
+      bounced = true;
     }
-    car.speed *= 0.25;
+  }
+
+  if (bounced) {
+    car.speed = Math.min(Math.sqrt(vx * vx + vy * vy), MAX_SPEED);
+    if (car.speed > 1) car.angle = Math.atan2(vy, vx);
   }
 }
 
@@ -485,13 +525,19 @@ function makeCar(slotIndex, posIndex) {
     angle: pos.angle,
     speed: 0,
     prevSector: getSector(pos.x, pos.y),
-    nextSector: 1,         // next sector to enter (sectors 0→1→2→3→0 = 1 lap)
+    nextSector: 1,
     sectorsPassed: 0,
     lap: 0,
     finished: false,
     finishTime: 0,
     color: SLOT_COLORS[slotIndex],
     slotIndex,
+    // physics extras
+    spinVel: 0,
+    hitFlash: 0,
+    hitCooldown: 0,
+    fireTimer: 0,
+    bullets: [],   // own fired bullets
   };
 }
 
@@ -524,9 +570,14 @@ function startGame(msg) {
 // CAR PHYSICS
 // ============================================================
 function updateCar(car, dt) {
+  car.hitCooldown = Math.max(0, car.hitCooldown - dt);
+  car.hitFlash    = Math.max(0, car.hitFlash - dt);
+  car.spinVel    *= Math.exp(-SPIN_DECAY * dt);
+  car.angle      += car.spinVel * dt;
+
   if (car.finished || !raceGo) return;
 
-  // P1 uses Arrow keys only
+  // P1 — Arrow keys
   if (keys['ArrowUp']) {
     car.speed = Math.min(car.speed + ACCEL * dt, MAX_SPEED);
   } else if (keys['ArrowDown']) {
@@ -537,13 +588,18 @@ function updateCar(car, dt) {
   }
 
   const grip = Math.abs(car.speed) / MAX_SPEED;
-  if (keys['ArrowLeft']) car.angle -= TURN_RATE * grip * dt;
+  if (keys['ArrowLeft'])  car.angle -= TURN_RATE * grip * dt;
   if (keys['ArrowRight']) car.angle += TURN_RATE * grip * dt;
+
+  // P1 fire — ShiftRight, ControlRight, or Slash
+  const p1Firing = keys['ShiftRight'] || keys['ControlRight'] || keys['Slash'];
+  tryFire(car, p1Firing, dt);
+  updateBullets(car.bullets, dt);
 
   car.x += Math.cos(car.angle) * car.speed * dt;
   car.y += Math.sin(car.angle) * car.speed * dt;
 
-  pushToTrack(car);
+  bounceOnWalls(car);
 
   // Lap counting via sector transitions
   const sector = getSector(car.x, car.y);
@@ -570,10 +626,124 @@ function checkAllFinished() {
   }
 }
 
+// ============================================================
+// WEAPONS & COLLISIONS
+// ============================================================
+function applyHit(car) {
+  if (car.hitCooldown > 0) return;
+  car.hitCooldown = HIT_COOLDOWN;
+  car.spinVel += (Math.random() < 0.5 ? 1 : -1) * HIT_SPIN;
+  car.spinVel = Math.max(-6, Math.min(6, car.spinVel));
+  car.speed *= HIT_SPEED_MULT;
+  car.hitFlash = HIT_FLASH_DUR;
+}
+
+function tryFire(car, firing, dt) {
+  car.fireTimer = Math.max(0, car.fireTimer - dt);
+  if (!firing || car.finished || car.fireTimer > 0) return;
+  car.fireTimer = FIRE_RATE;
+  const bvx = Math.cos(car.angle) * (BULLET_SPEED + Math.abs(car.speed));
+  const bvy = Math.sin(car.angle) * (BULLET_SPEED + Math.abs(car.speed));
+  car.bullets.push({
+    x: car.x + Math.cos(car.angle) * (CAR_L / 2 + 5),
+    y: car.y + Math.sin(car.angle) * (CAR_L / 2 + 5),
+    vx: bvx, vy: bvy, life: BULLET_LIFE
+  });
+}
+
+function updateBullets(bullets, dt) {
+  for (let i = bullets.length - 1; i >= 0; i--) {
+    const b = bullets[i];
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+    b.life -= dt;
+    if (b.life <= 0) bullets.splice(i, 1);
+  }
+}
+
+// Check if remote cars' bullets hit a local car
+function checkRemoteHits(localCar) {
+  for (const remCar of remoteCars.values()) {
+    if (!remCar.bullets) continue;
+    for (const [bx, by] of remCar.bullets) {
+      const dx = bx - localCar.x, dy = by - localCar.y;
+      if (dx * dx + dy * dy < HIT_RADIUS * HIT_RADIUS) {
+        applyHit(localCar);
+        return;
+      }
+    }
+  }
+}
+
+// Check if a local car's own bullets hit another local car
+function checkLocalBulletHits(shooterBullets, targetCar) {
+  for (const b of shooterBullets) {
+    const dx = b.x - targetCar.x, dy = b.y - targetCar.y;
+    if (dx * dx + dy * dy < HIT_RADIUS * HIT_RADIUS) {
+      applyHit(targetCar);
+      return;
+    }
+  }
+}
+
+// Two-body car collision (both affected — used for local vs local)
+function collideCars(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  const distSq = dx * dx + dy * dy;
+  const minDist = CAR_RADIUS * 2;
+  if (distSq >= minDist * minDist || distSq < 0.01) return;
+  const dist = Math.sqrt(distSq);
+  const nx = dx / dist, ny = dy / dist;
+  const push = (minDist - dist) * 0.5;
+  a.x += nx * push; a.y += ny * push;
+  b.x -= nx * push; b.y -= ny * push;
+  let avx = Math.cos(a.angle) * a.speed, avy = Math.sin(a.angle) * a.speed;
+  let bvx = Math.cos(b.angle) * b.speed, bvy = Math.sin(b.angle) * b.speed;
+  const relVel = (avx - bvx) * nx + (avy - bvy) * ny;
+  if (relVel >= 0) return;
+  const impulse = -(1 + CAR_BOUNCE) * relVel * 0.5;
+  avx += impulse * nx; avy += impulse * ny;
+  bvx -= impulse * nx; bvy -= impulse * ny;
+  a.speed = Math.min(Math.sqrt(avx * avx + avy * avy), MAX_SPEED * 1.3);
+  b.speed = Math.min(Math.sqrt(bvx * bvx + bvy * bvy), MAX_SPEED * 1.3);
+  if (a.speed > 1) a.angle = Math.atan2(avy, avx);
+  if (b.speed > 1) b.angle = Math.atan2(bvy, bvx);
+  a.spinVel += (Math.random() - 0.5) * 3;
+  b.spinVel += (Math.random() - 0.5) * 3;
+}
+
+// One-body collision — only push mine away from other (remote car)
+function collideCarOneWay(mine, other) {
+  const dx = mine.x - other.x, dy = mine.y - other.y;
+  const distSq = dx * dx + dy * dy;
+  const minDist = CAR_RADIUS * 2;
+  if (distSq >= minDist * minDist || distSq < 0.01) return;
+  const dist = Math.sqrt(distSq);
+  const nx = dx / dist, ny = dy / dist;
+  mine.x = other.x + nx * minDist;
+  mine.y = other.y + ny * minDist;
+  let vx = Math.cos(mine.angle) * mine.speed;
+  let vy = Math.sin(mine.angle) * mine.speed;
+  const dot = vx * nx + vy * ny;
+  if (dot < 0) {
+    vx -= 2 * dot * nx; vy -= 2 * dot * ny;
+    vx *= CAR_BOUNCE;   vy *= CAR_BOUNCE;
+    mine.speed = Math.min(Math.sqrt(vx * vx + vy * vy), MAX_SPEED * 1.3);
+    if (mine.speed > 1) mine.angle = Math.atan2(vy, vx);
+    mine.spinVel += (Math.random() - 0.5) * 3;
+  }
+}
+
 // P2 car physics — WASD controls
 function updateCarP2(car, dt) {
+  car.hitCooldown = Math.max(0, car.hitCooldown - dt);
+  car.hitFlash    = Math.max(0, car.hitFlash - dt);
+  car.spinVel    *= Math.exp(-SPIN_DECAY * dt);
+  car.angle      += car.spinVel * dt;
+
   if (car.finished || !raceGo) return;
 
+  // P2 — WASD
   if (keys['KeyW']) {
     car.speed = Math.min(car.speed + ACCEL * dt, MAX_SPEED);
   } else if (keys['KeyS']) {
@@ -587,9 +757,14 @@ function updateCarP2(car, dt) {
   if (keys['KeyA']) car.angle -= TURN_RATE * grip * dt;
   if (keys['KeyD']) car.angle += TURN_RATE * grip * dt;
 
+  // P2 fire — ShiftLeft, ControlLeft, or Tab
+  const p2Firing = keys['ShiftLeft'] || keys['ControlLeft'] || keys['Tab'];
+  tryFire(car, p2Firing, dt);
+  updateBullets(car.bullets, dt);
+
   car.x += Math.cos(car.angle) * car.speed * dt;
   car.y += Math.sin(car.angle) * car.speed * dt;
-  pushToTrack(car);
+  bounceOnWalls(car);
 
   const sector = getSector(car.x, car.y);
   if (sector !== car.prevSector && sector === car.nextSector) {
@@ -691,6 +866,12 @@ function drawCar(car, label, isMe) {
   ctx.fillRect(-CAR_L / 2, -CAR_W / 2 + 2, 3, 3);
   ctx.fillRect(-CAR_L / 2, CAR_W / 2 - 5, 3, 3);
 
+  // Hit flash — white overlay
+  if (car.hitFlash > 0) {
+    ctx.fillStyle = `rgba(255,255,255,${Math.min(1, car.hitFlash / HIT_FLASH_DUR) * 0.7})`;
+    ctx.fillRect(-CAR_L / 2, -CAR_W / 2, CAR_L, CAR_W);
+  }
+
   ctx.restore();
 
   // Name label
@@ -698,6 +879,26 @@ function drawCar(car, label, isMe) {
   ctx.font = isMe ? 'bold 11px monospace' : '10px monospace';
   ctx.fillStyle = isMe ? '#fff' : 'rgba(255,255,255,0.7)';
   ctx.fillText(label, car.x, car.y - 20);
+}
+
+function drawBullets(bullets, color) {
+  if (!bullets || !bullets.length) return;
+  ctx.fillStyle = color;
+  for (const b of bullets) {
+    const alpha = Math.min(1, b.life * 3);
+    ctx.globalAlpha = alpha;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+    ctx.fill();
+    // Tracer line
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - b.vx * 0.018, b.y - b.vy * 0.018);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
 }
 
 // ============================================================
@@ -960,31 +1161,62 @@ function loop(ts) {
     drawLobby(dt);
 
   } else if (lobbyState === 'game') {
+    // Update physics
+    if (myCar)   updateCar(myCar, dt);
+    if (myCarP2) updateCarP2(myCarP2, dt);
+
+    // Car-to-car collisions
+    if (myCar && myCarP2) collideCars(myCar, myCarP2);
+    for (const remCar of remoteCars.values()) {
+      if (myCar)   collideCarOneWay(myCar, remCar);
+      if (myCarP2) collideCarOneWay(myCarP2, remCar);
+    }
+
+    // Bullet hit detection — remote bullets vs local cars
+    if (myCar)   checkRemoteHits(myCar);
+    if (myCarP2) checkRemoteHits(myCarP2);
+    // Local P1 bullets vs P2 and vice versa
+    if (myCar && myCarP2) {
+      checkLocalBulletHits(myCar.bullets, myCarP2);
+      checkLocalBulletHits(myCarP2.bullets, myCar);
+    }
+
+    // Broadcast (bullets as compact [x,y] pairs)
     if (myCar) {
-      updateCar(myCar, dt);
       broadcast({
         type: 'update', peerId: myPeerId,
         car: { x: myCar.x, y: myCar.y, angle: myCar.angle, speed: myCar.speed,
                sectorsPassed: myCar.sectorsPassed, lap: myCar.lap,
-               finished: myCar.finished, color: myCar.color, slotIndex: myCar.slotIndex }
+               finished: myCar.finished, color: myCar.color, slotIndex: myCar.slotIndex,
+               bullets: myCar.bullets.map(b => [Math.round(b.x), Math.round(b.y)]) }
       });
     }
     if (myCarP2) {
-      updateCarP2(myCarP2, dt);
       broadcast({
         type: 'update', peerId: myP2PeerId,
         car: { x: myCarP2.x, y: myCarP2.y, angle: myCarP2.angle, speed: myCarP2.speed,
                sectorsPassed: myCarP2.sectorsPassed, lap: myCarP2.lap,
-               finished: myCarP2.finished, color: myCarP2.color, slotIndex: myCarP2.slotIndex }
+               finished: myCarP2.finished, color: myCarP2.color, slotIndex: myCarP2.slotIndex,
+               bullets: myCarP2.bullets.map(b => [Math.round(b.x), Math.round(b.y)]) }
       });
     }
 
+    // Render
     drawTrack();
     for (const [pid, car] of remoteCars) {
-      if (car) drawCar(car, pid.slice(0, 5), false);
+      if (car) {
+        drawCar(car, pid.slice(0, 5), false);
+        // Remote bullets (stored as [x,y] pairs, draw without tracer)
+        if (car.bullets) {
+          ctx.fillStyle = car.color || '#fff';
+          for (const [bx, by] of car.bullets) {
+            ctx.beginPath(); ctx.arc(bx, by, 3, 0, Math.PI * 2); ctx.fill();
+          }
+        }
+      }
     }
-    if (myCarP2) drawCar(myCarP2, 'P2', false);
-    if (myCar) drawCar(myCar, 'P1', true);
+    if (myCarP2) { drawCar(myCarP2, 'P2', false); drawBullets(myCarP2.bullets, myCarP2.color); }
+    if (myCar)   { drawCar(myCar,   'P1', true);  drawBullets(myCar.bullets,   myCar.color);   }
     drawHUD();
 
     const totalReady = slots.filter(s => s.ready).length;
