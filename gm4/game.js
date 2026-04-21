@@ -13,10 +13,11 @@ const TOTAL_LAPS = 3;
 const COUNTDOWN_DURATION = 3.0;
 const HOLD_DURATION = 2.0;
 
-// Track (rounded-rectangle, clockwise in screen coords)
+// Track: left side = two 90° corners (rounded-rect), right side = 180° hairpin (semicircle)
 const TCX = GW / 2, TCY = GH / 2;
 const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-height, corner-radius
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
+const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
 // Car constants
 const CAR_L = 26, CAR_W = 13;
@@ -449,19 +450,38 @@ function getSector(x, y) {
   return 3;                                      // top
 }
 
-// Signed-distance function for a rounded rectangle centred at (TCX, TCY).
+// SDF for the D-shape outer boundary.
+// Left portion: rectangular with rounded left corners; right portion: semicircle.
 // Returns < 0 inside, 0 on surface, > 0 outside.
-function sdfRR(px, py, hw, hh, r) {
-  const qx = Math.abs(px - TCX) - hw + r;
-  const qy = Math.abs(py - TCY) - hh + r;
-  return Math.sqrt(Math.max(qx, 0) ** 2 + Math.max(qy, 0) ** 2) + Math.min(Math.max(qx, qy), 0) - r;
+function sdfOuter(px, py) {
+  if (px >= SC_X) return Math.sqrt((px - SC_X) ** 2 + (py - TCY) ** 2) - O_HH;
+  const lx = TCX - O_HW + O_R, ty = TCY - O_HH + O_R, by = TCY + O_HH - O_R;
+  if (px < lx && py < ty) return Math.sqrt((px - lx) ** 2 + (py - ty) ** 2) - O_R;
+  if (px < lx && py > by) return Math.sqrt((px - lx) ** 2 + (py - by) ** 2) - O_R;
+  return -Math.min(px - (TCX - O_HW), O_HH - Math.abs(py - TCY));
 }
 
-// Unit outward normal of a rounded-rectangle SDF (numerical gradient).
-function rrNormal(px, py, hw, hh, r) {
+// SDF for the D-shape inner island boundary.
+function sdfInner(px, py) {
+  if (px >= SC_X) return Math.sqrt((px - SC_X) ** 2 + (py - TCY) ** 2) - I_HH;
+  const lx = TCX - I_HW + I_R, ty = TCY - I_HH + I_R, by = TCY + I_HH - I_R;
+  if (px < lx && py < ty) return Math.sqrt((px - lx) ** 2 + (py - ty) ** 2) - I_R;
+  if (px < lx && py > by) return Math.sqrt((px - lx) ** 2 + (py - by) ** 2) - I_R;
+  return -Math.min(px - (TCX - I_HW), I_HH - Math.abs(py - TCY));
+}
+
+function outerNormal(px, py) {
   const e = 1;
-  const dx = sdfRR(px + e, py, hw, hh, r) - sdfRR(px - e, py, hw, hh, r);
-  const dy = sdfRR(px, py + e, hw, hh, r) - sdfRR(px, py - e, hw, hh, r);
+  const dx = sdfOuter(px + e, py) - sdfOuter(px - e, py);
+  const dy = sdfOuter(px, py + e) - sdfOuter(px, py - e);
+  const len = Math.sqrt(dx * dx + dy * dy);
+  return len < 0.001 ? { nx: 1, ny: 0 } : { nx: dx / len, ny: dy / len };
+}
+
+function innerNormal(px, py) {
+  const e = 1;
+  const dx = sdfInner(px + e, py) - sdfInner(px - e, py);
+  const dy = sdfInner(px, py + e) - sdfInner(px, py - e);
   const len = Math.sqrt(dx * dx + dy * dy);
   return len < 0.001 ? { nx: 1, ny: 0 } : { nx: dx / len, ny: dy / len };
 }
@@ -472,9 +492,9 @@ function bounceOnWalls(car) {
   let bounced = false;
 
   // Outside outer boundary — push inward and reflect
-  const od = sdfRR(car.x, car.y, O_HW, O_HH, O_R);
+  const od = sdfOuter(car.x, car.y);
   if (od > -1) {
-    const { nx, ny } = rrNormal(car.x, car.y, O_HW, O_HH, O_R);
+    const { nx, ny } = outerNormal(car.x, car.y);
     car.x -= nx * (od + 1);
     car.y -= ny * (od + 1);
     const dot = vx * nx + vy * ny;
@@ -487,9 +507,9 @@ function bounceOnWalls(car) {
   }
 
   // Inside inner island — push outward and reflect
-  const id = sdfRR(car.x, car.y, I_HW, I_HH, I_R);
+  const id = sdfInner(car.x, car.y);
   if (id < 1) {
-    const { nx, ny } = rrNormal(car.x, car.y, I_HW, I_HH, I_R);
+    const { nx, ny } = innerNormal(car.x, car.y);
     car.x += nx * (1 - id);
     car.y += ny * (1 - id);
     const dot = vx * nx + vy * ny;
@@ -507,14 +527,14 @@ function bounceOnWalls(car) {
   }
 }
 
-// Start grid: right-side straight, 2 columns × 4 rows, cars facing south (clockwise)
+// Start grid: top straight, 2 lanes × 4 rows, cars facing right (clockwise)
 function getStartPos(index) {
   const col = index % 2;
   const row = Math.floor(index / 2);
   return {
-    x: 1085 - col * 55,
-    y: 225 + row * 40,
-    angle: Math.PI / 2
+    x: 835 - row * 55,
+    y: 135 + col * 50,
+    angle: 0
   };
 }
 
@@ -528,7 +548,7 @@ function makeCar(slotIndex, posIndex) {
     angle: pos.angle,
     speed: 0,
     prevSector: getSector(pos.x, pos.y),
-    nextSector: 1,
+    nextSector: (getSector(pos.x, pos.y) + 1) % 4,
     sectorsPassed: 0,
     lap: 0,
     finished: false,
@@ -789,51 +809,63 @@ function updateCarP2(car, dt) {
 // RENDERING — TRACK
 // ============================================================
 function drawTrack() {
+  // Build a D-shape canvas path (clockwise): left side = rounded rect, right side = semicircle.
+  function dPath(lx, ty, by, r) {
+    const cy = (ty + by) / 2, rr = (by - ty) / 2;
+    ctx.beginPath();
+    ctx.moveTo(lx + r, ty);
+    ctx.lineTo(SC_X, ty);
+    ctx.arc(SC_X, cy, rr, -Math.PI / 2, Math.PI / 2);              // right hairpin
+    ctx.lineTo(lx + r, by);
+    ctx.arc(lx + r, by - r, r, Math.PI / 2, Math.PI);              // bottom-left corner
+    ctx.lineTo(lx, ty + r);
+    ctx.arc(lx + r, ty + r, r, Math.PI, 3 * Math.PI / 2);          // top-left corner
+    ctx.closePath();
+  }
+
   // Grass
   ctx.fillStyle = '#1e4d0f';
   ctx.fillRect(0, 0, GW, GH);
 
-  // Asphalt (outer rounded-rect with 12 px visual margin beyond bounce boundary)
-  ctx.beginPath();
-  ctx.roundRect(TCX - O_HW - 12, TCY - O_HH - 12, (O_HW + 12) * 2, (O_HH + 12) * 2, O_R + 12);
+  // Asphalt (outer D with 12 px visual margin)
+  dPath(TCX - O_HW - 12, TCY - O_HH - 12, TCY + O_HH + 12, O_R + 12);
   ctx.fillStyle = '#3a3a3a';
   ctx.fill();
 
   // Inner grass island
-  ctx.beginPath();
-  ctx.roundRect(TCX - I_HW + 12, TCY - I_HH + 12, (I_HW - 12) * 2, (I_HH - 12) * 2, I_R - 12);
+  dPath(TCX - I_HW + 12, TCY - I_HH + 12, TCY + I_HH - 12, I_R - 12);
   ctx.fillStyle = '#1e4d0f';
   ctx.fill();
 
   // Outer white border
   ctx.strokeStyle = '#ddd';
   ctx.lineWidth = 5;
-  ctx.beginPath();
-  ctx.roundRect(TCX - O_HW - 10, TCY - O_HH - 10, (O_HW + 10) * 2, (O_HH + 10) * 2, O_R + 10);
+  dPath(TCX - O_HW - 10, TCY - O_HH - 10, TCY + O_HH + 10, O_R + 10);
   ctx.stroke();
 
   // Inner white border
-  ctx.beginPath();
-  ctx.roundRect(TCX - I_HW + 10, TCY - I_HH + 10, (I_HW - 10) * 2, (I_HH - 10) * 2, I_R - 10);
+  dPath(TCX - I_HW + 10, TCY - I_HH + 10, TCY + I_HH - 10, I_R - 10);
   ctx.stroke();
 
   // Dashed centre line (midpoint between outer and inner boundaries)
-  const MHW = (O_HW + I_HW) / 2, MHH = (O_HH + I_HH) / 2, MR = (O_R + I_R) / 2;
   ctx.strokeStyle = 'rgba(255,255,255,0.25)';
   ctx.lineWidth = 2;
   ctx.setLineDash([24, 24]);
-  ctx.beginPath();
-  ctx.roundRect(TCX - MHW, TCY - MHH, MHW * 2, MHH * 2, MR);
+  dPath((TCX - O_HW + TCX - I_HW) / 2,
+        (TCY - O_HH + TCY - I_HH) / 2,
+        (TCY + O_HH + TCY + I_HH) / 2,
+        (O_R + I_R) / 2);
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Start/finish line — right-side straight at y = TCY
-  const sfX1 = TCX + I_HW - 10, sfX2 = TCX + O_HW + 10;
-  const sqW = 12, sqH = 10;
-  const cols = Math.floor((sfX2 - sfX1) / sqW);
-  for (let i = 0; i < cols; i++) {
-    ctx.fillStyle = (i % 2 === 0) ? '#fff' : '#111';
-    ctx.fillRect(sfX1 + i * sqW, TCY - sqH / 2, sqW, sqH);
+  // Start/finish line — vertical bar on top straight at x = SC_X - 30
+  const sfX = SC_X - 30;
+  const sfY1 = TCY - O_HH - 2, sfY2 = TCY - I_HH + 2;
+  const sqH = 12, sqW = 10;
+  const rows = Math.floor((sfY2 - sfY1) / sqH);
+  for (let j = 0; j < rows; j++) {
+    ctx.fillStyle = (j % 2 === 0) ? '#fff' : '#111';
+    ctx.fillRect(sfX - sqW / 2, sfY1 + j * sqH, sqW, sqH);
   }
 }
 
