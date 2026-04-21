@@ -1234,17 +1234,6 @@ function loop(ts) {
 // ============================================================
 // INIT
 // ============================================================
-const roomInput = document.getElementById('roomInput');
-const joinBtn = document.getElementById('joinBtn');
-const connectDiv = document.getElementById('connect');
-
-joinBtn.addEventListener('click', () => {
-  const room = roomInput.value.trim();
-  joinBtn.disabled = true;
-  connect(room);
-  connectDiv.style.display = 'none';
-  // Auto-claim a slot immediately
-  claimSlot();
-});
-
+connect();   // no room code — signaling server groups by LAN/IP automatically
+claimSlot();
 requestAnimationFrame(loop);
