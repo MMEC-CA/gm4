@@ -31,3 +31,12 @@ Manual deploy:
 ```
 npx wrangler@4 deploy
 ```
+
+## Versioning
+
+Every code change gets a new version tag in the format `YYYY-MM-DD-aa`.
+
+- The date is the calendar date the change was made.
+- The suffix starts at `-aa` for the first change on a given day, then increments: `-ab`, `-ac`, `-ad`, …
+- The suffix resets to `-aa` on each new day.
+- The current version is declared as `const VERSION` near the top of `gm4/game.js` and displayed in the top-left of the lobby.

@@ -19,6 +19,17 @@ const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-h
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
 const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
+const VERSION = '2026-04-21-aa';
+
+// AI car constants
+const AI_COUNT = 6;
+const AI_SPEED = 255;
+const AI_ACCEL = 380;
+const AI_TURN_RATE = 2.0;
+const AI_AVOID_RADIUS = 55;
+const AI_AGGRO_INTERVAL = 15;
+const AI_COLORS = ['#e06060', '#60c0a0', '#60a0d0', '#80c880', '#c0b040', '#b060c0'];
+
 // Car constants
 const CAR_L = 26, CAR_W = 13;
 const MAX_SPEED = 400;   // px/s
@@ -74,6 +85,11 @@ let raceStartTime = 0;
 let raceGo = false;           // engines running
 let finishOrder = [];         // [{peerId, time}]
 let goFlashTimer = 0;
+
+// AI state
+let aiCars = [];
+let aggroTimer = AI_AGGRO_INTERVAL;
+let aggroCar = null;
 
 // Input
 const keys = {};
@@ -582,6 +598,7 @@ function startGame(msg) {
   if (myP2Entry) {
     myCarP2 = makeCar(myP2Entry.slotIndex, playerSlots.indexOf(myP2Entry));
   }
+  initAICars();
   // Start race after 3 seconds
   setTimeout(() => {
     raceGo = true;
@@ -941,6 +958,11 @@ function drawLobby(dt) {
   ctx.fillStyle = '#0a0a0a';
   ctx.fillRect(0, 0, GW, GH);
 
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#444';
+  ctx.font = '12px monospace';
+  ctx.fillText('v' + VERSION, 10, 18);
+
   // Title
   ctx.textAlign = 'center';
   ctx.fillStyle = '#fff';
@@ -1177,6 +1199,134 @@ function drawFinish() {
 }
 
 // ============================================================
+// AI CARS
+// ============================================================
+
+function lerpAngle(a, b, t) {
+  let d = b - a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return a + d * t;
+}
+
+function getTrackTangent(px, py, cw) {
+  const { nx, ny } = innerNormal(px, py);
+  return cw ? { tx: -ny, ty: nx } : { tx: ny, ty: -nx };
+}
+
+function makeAICar(index) {
+  const cw = index < 3;
+  const starts = [
+    { x: 720, y: 120, a: 0 },              // CW 0: top straight, outer lane
+    { x: 460, y: 600, a: Math.PI },         // CW 1: bottom straight, outer lane
+    { x: 1150, y: 300, a: Math.PI / 2 },    // CW 2: right hairpin, outer lane
+    { x: 440, y: 200, a: Math.PI },         // CCW 3: top straight, inner lane
+    { x: 720, y: 520, a: 0 },              // CCW 4: bottom straight, inner lane
+    { x: 1070, y: 420, a: -Math.PI / 2 },   // CCW 5: right hairpin, inner lane
+  ];
+  const s = starts[index];
+  return {
+    x: s.x, y: s.y, angle: s.a,
+    speed: AI_SPEED * 0.6,
+    cw, isAI: true, color: AI_COLORS[index],
+    spinVel: 0, hitFlash: 0, hitCooldown: 0,
+    isAggro: false, aggroTarget: null,
+    prevSector: getSector(s.x, s.y),
+    nextSector: (getSector(s.x, s.y) + 1) % 4,
+    sectorsPassed: 0, lap: 0, finished: false, finishTime: 0,
+    slotIndex: -1, fireTimer: 0, bullets: [],
+  };
+}
+
+function initAICars() {
+  aiCars = [];
+  for (let i = 0; i < AI_COUNT; i++) aiCars.push(makeAICar(i));
+  aggroTimer = AI_AGGRO_INTERVAL;
+  aggroCar = null;
+}
+
+function getLeadPlayer() {
+  const players = [myCar, myCarP2, ...remoteCars.values()].filter(c => c && !c.finished);
+  if (!players.length) return null;
+  return players.reduce((b, c) =>
+    (c.lap * 100 + c.sectorsPassed) > (b.lap * 100 + b.sectorsPassed) ? c : b);
+}
+
+function updateAICar(car, dt) {
+  if (!raceGo) return;
+  car.hitCooldown = Math.max(0, car.hitCooldown - dt);
+  car.hitFlash = Math.max(0, car.hitFlash - dt);
+  car.spinVel *= Math.exp(-SPIN_DECAY * dt);
+  car.angle += car.spinVel * dt;
+
+  const { tx, ty } = getTrackTangent(car.x, car.y, car.cw);
+  let desired = Math.atan2(ty, tx);
+
+  if (car.isAggro && car.aggroTarget) {
+    const t = car.aggroTarget;
+    const dx = t.x - car.x, dy = t.y - car.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 30)
+      desired = lerpAngle(desired, Math.atan2(dy, dx), Math.min(0.45, 120 / dist));
+  }
+
+  const others = [myCar, myCarP2, ...remoteCars.values(), ...aiCars].filter(c => c && c !== car);
+  let ax = 0, ay = 0;
+  for (const o of others) {
+    const dx = car.x - o.x, dy = car.y - o.y;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < AI_AVOID_RADIUS && d > 0.5) {
+      const f = 1 - d / AI_AVOID_RADIUS;
+      ax += (dx / d) * f;
+      ay += (dy / d) * f;
+    }
+  }
+  const avoidMag = Math.sqrt(ax * ax + ay * ay);
+  if (avoidMag > 0.05)
+    desired = lerpAngle(desired, Math.atan2(ay, ax), Math.min(avoidMag * 0.7, 0.6));
+
+  const laneTarget = car.cw ? -50 : -130;
+  const od = sdfOuter(car.x, car.y);
+  const laneErr = od - laneTarget;
+  if (Math.abs(laneErr) > 8) {
+    const { nx, ny } = outerNormal(car.x, car.y);
+    desired = lerpAngle(desired, Math.atan2(-laneErr * ny, -laneErr * nx), 0.12);
+  }
+
+  let diff = desired - car.angle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  car.angle += Math.sign(diff) * Math.min(Math.abs(diff) * 4, AI_TURN_RATE) * dt;
+
+  const topSpeed = car.isAggro ? AI_SPEED * 1.15 : AI_SPEED;
+  if (car.speed < topSpeed) car.speed = Math.min(car.speed + AI_ACCEL * dt, topSpeed);
+  else car.speed *= Math.exp(-FRICTION_K * dt);
+
+  car.x += Math.cos(car.angle) * car.speed * dt;
+  car.y += Math.sin(car.angle) * car.speed * dt;
+  bounceOnWalls(car);
+
+  const sec = getSector(car.x, car.y);
+  if (sec !== car.prevSector && sec === car.nextSector) {
+    car.sectorsPassed++;
+    car.lap = Math.floor(car.sectorsPassed / 4);
+    car.nextSector = (car.nextSector + 1) % 4;
+  }
+  car.prevSector = sec;
+}
+
+function updateAggroState(dt) {
+  aggroTimer -= dt;
+  if (aggroTimer <= 0) {
+    aggroTimer = AI_AGGRO_INTERVAL;
+    if (aggroCar) { aggroCar.isAggro = false; aggroCar.aggroTarget = null; }
+    aggroCar = aiCars.length ? aiCars[Math.floor(Math.random() * aiCars.length)] : null;
+    if (aggroCar) { aggroCar.isAggro = true; aggroCar.aggroTarget = getLeadPlayer(); }
+  }
+  if (aggroCar && aggroCar.isAggro) aggroCar.aggroTarget = getLeadPlayer();
+}
+
+// ============================================================
 // GAME LOOP
 // ============================================================
 let lastTime = 0;
@@ -1198,12 +1348,23 @@ function loop(ts) {
     if (myCar)   updateCar(myCar, dt);
     if (myCarP2) updateCarP2(myCarP2, dt);
 
+    // AI updates
+    updateAggroState(dt);
+    for (const ai of aiCars) updateAICar(ai, dt);
+
     // Car-to-car collisions
     if (myCar && myCarP2) collideCars(myCar, myCarP2);
     for (const remCar of remoteCars.values()) {
       if (myCar)   collideCarOneWay(myCar, remCar);
       if (myCarP2) collideCarOneWay(myCarP2, remCar);
     }
+    for (const ai of aiCars) {
+      if (myCar)   collideCars(myCar, ai);
+      if (myCarP2) collideCars(myCarP2, ai);
+    }
+    for (let i = 0; i < aiCars.length; i++)
+      for (let j = i + 1; j < aiCars.length; j++)
+        collideCars(aiCars[i], aiCars[j]);
 
     // Bullet hit detection — remote bullets vs local cars
     if (myCar)   checkRemoteHits(myCar);
@@ -1248,6 +1409,7 @@ function loop(ts) {
         }
       }
     }
+    for (const ai of aiCars) drawCar(ai, ai.isAggro ? 'AI!' : 'AI', false);
     if (myCarP2) { drawCar(myCarP2, 'P2', false); drawBullets(myCarP2.bullets, myCarP2.color); }
     if (myCar)   { drawCar(myCar,   'P1', true);  drawBullets(myCar.bullets,   myCar.color);   }
     drawHUD();
