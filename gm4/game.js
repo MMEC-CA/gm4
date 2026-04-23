@@ -19,7 +19,7 @@ const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-h
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
 const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
-const VERSION = '2026-04-21-aa';
+const VERSION = '2026-04-23-aa';
 
 // AI car constants
 const AI_COUNT = 6;
@@ -286,9 +286,9 @@ function connect(room) {
 function onSigMsg(ev) {
   const data = JSON.parse(ev.data);
   if (data.type === 'peers') {
-    data.peers.forEach(id => { if (id !== myPeerId) createPc(id, true); });
+    data.peers.forEach(id => { if (id !== myPeerId && !pcs.has(id) && myPeerId < id) createPc(id, true); });
   } else if (data.type === 'peer-joined') {
-    if (data.peerId !== myPeerId && !pcs.has(data.peerId)) createPc(data.peerId, true);
+    if (data.peerId !== myPeerId && !pcs.has(data.peerId) && myPeerId < data.peerId) createPc(data.peerId, true);
   } else if (data.type === 'peer-left') {
     cleanupPeer(data.peerId);
   } else if (data.type === 'signal') {
@@ -296,19 +296,24 @@ function onSigMsg(ev) {
   }
 }
 
+const pendingCandidates = new Map();
+
 function createPc(peerId, initiator) {
   const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
   pcs.set(peerId, pc);
 
   pc.onicecandidate = e => {
-    if (e.candidate) sendSig(peerId, { type: 'candidate', candidate: e.candidate });
+    if (e.candidate) sendSig(peerId, e.candidate.toJSON());
+  };
+
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') cleanupPeer(peerId);
   };
 
   const dc = pc.createDataChannel('game', { negotiated: true, id: 0 });
   dcs.set(peerId, dc);
 
   dc.onopen = () => {
-    // Send full lobby state so late joiners get current snapshot
     dc.send(JSON.stringify({
       type: 'lobby-sync',
       slots: slots.map((s, i) => ({ ...s, index: i })),
@@ -320,10 +325,18 @@ function createPc(peerId, initiator) {
   dc.onmessage = e => handleMsg(peerId, JSON.parse(e.data));
 
   if (initiator) {
-    pc.createOffer().then(offer => {
-      pc.setLocalDescription(offer);
-      sendSig(peerId, { type: 'offer', sdp: offer.sdp });
-    });
+    pc.createOffer()
+      .then(offer => pc.setLocalDescription(offer))
+      .then(() => sendSig(peerId, pc.localDescription));
+  }
+}
+
+function flushCandidates(peerId) {
+  const pc = pcs.get(peerId);
+  const pending = pendingCandidates.get(peerId);
+  if (pc && pc.remoteDescription && pending) {
+    pending.forEach(c => pc.addIceCandidate(new RTCIceCandidate(c)));
+    pendingCandidates.delete(peerId);
   }
 }
 
@@ -331,15 +344,20 @@ function handleSignal(from, sig) {
   let pc = pcs.get(from);
   if (!pc) { createPc(from, false); pc = pcs.get(from); }
   if (sig.type === 'offer') {
-    pc.setRemoteDescription({ type: 'offer', sdp: sig.sdp });
-    pc.createAnswer().then(ans => {
-      pc.setLocalDescription(ans);
-      sendSig(from, { type: 'answer', sdp: ans.sdp });
-    });
+    pc.setRemoteDescription(new RTCSessionDescription(sig))
+      .then(() => pc.createAnswer())
+      .then(ans => pc.setLocalDescription(ans))
+      .then(() => { sendSig(from, pc.localDescription); flushCandidates(from); });
   } else if (sig.type === 'answer') {
-    pc.setRemoteDescription({ type: 'answer', sdp: sig.sdp });
-  } else if (sig.type === 'candidate') {
-    pc.addIceCandidate(sig.candidate);
+    pc.setRemoteDescription(new RTCSessionDescription(sig))
+      .then(() => flushCandidates(from));
+  } else if (sig.candidate !== undefined) {
+    if (pc.remoteDescription) {
+      pc.addIceCandidate(new RTCIceCandidate(sig));
+    } else {
+      if (!pendingCandidates.has(from)) pendingCandidates.set(from, []);
+      pendingCandidates.get(from).push(sig);
+    }
   }
 }
 
