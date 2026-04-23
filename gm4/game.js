@@ -19,7 +19,7 @@ const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-h
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
 const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
-const VERSION = '2026-04-23-ad';
+const VERSION = '2026-04-23-ae';
 
 // AI car constants
 const AI_COUNT = 6;
@@ -48,6 +48,7 @@ const HIT_SPIN = 2.5;      // rad/s spin magnitude from bullet hit
 const HIT_SPEED_MULT = 0.72;
 const HIT_FLASH_DUR = 0.4;
 const SPIN_DECAY = 3.0;    // rad/s² decay rate
+const AI_SWERVE_DURATION = 1.0; // s AI swerves after being shot
 const WALL_BOUNCE = 0.62;  // speed retained on wall bounce
 const CAR_BOUNCE = 0.72;   // speed retained on car-car collision
 const CAR_RADIUS = 16;     // px, collision circle radius per car
@@ -608,6 +609,7 @@ function bounceOnWalls(car) {
     car.speed = Math.min(Math.sqrt(vx * vx + vy * vy), MAX_SPEED);
     if (car.speed > 1) car.angle = Math.atan2(vy, vx);
   }
+  return bounced;
 }
 
 // Start grid: top straight, 2 lanes × 4 rows, cars facing right (clockwise)
@@ -746,6 +748,36 @@ function applyHit(car) {
   car.hitFlash = HIT_FLASH_DUR;
 }
 
+function applyHitAI(car) {
+  if (car.hitCooldown > 0 || car.exploded) return;
+  car.hitCooldown = HIT_COOLDOWN;
+  car.swerveTimer = AI_SWERVE_DURATION;
+  car.hitFlash = HIT_FLASH_DUR;
+  car.spinVel += (Math.random() < 0.5 ? 1 : -1) * HIT_SPIN * 2;
+}
+
+function explodeAI(car) {
+  if (car.exploded) return;
+  car.exploded = true;
+  car.finished = true;
+  car.speed = 0;
+  car.swerveTimer = 0;
+  car.explodeTimer = 0.7;
+}
+
+function checkBulletsVsAI(bullets) {
+  for (const ai of aiCars) {
+    if (ai.exploded) continue;
+    for (const b of bullets) {
+      const dx = b.x - ai.x, dy = b.y - ai.y;
+      if (dx * dx + dy * dy < HIT_RADIUS * HIT_RADIUS) {
+        applyHitAI(ai);
+        break;
+      }
+    }
+  }
+}
+
 function tryFire(car, firing, dt) {
   car.fireTimer = Math.max(0, car.fireTimer - dt);
   if (!firing || car.finished || car.fireTimer > 0) return;
@@ -799,7 +831,7 @@ function collideCars(a, b) {
   const dx = a.x - b.x, dy = a.y - b.y;
   const distSq = dx * dx + dy * dy;
   const minDist = CAR_RADIUS * 2;
-  if (distSq >= minDist * minDist || distSq < 0.01) return;
+  if (distSq >= minDist * minDist || distSq < 0.01) return false;
   const dist = Math.sqrt(distSq);
   const nx = dx / dist, ny = dy / dist;
   const push = (minDist - dist) * 0.5;
@@ -808,7 +840,7 @@ function collideCars(a, b) {
   let avx = Math.cos(a.angle) * a.speed, avy = Math.sin(a.angle) * a.speed;
   let bvx = Math.cos(b.angle) * b.speed, bvy = Math.sin(b.angle) * b.speed;
   const relVel = (avx - bvx) * nx + (avy - bvy) * ny;
-  if (relVel >= 0) return;
+  if (relVel >= 0) return true;
   const impulse = -(1 + CAR_BOUNCE) * relVel * 0.5;
   avx += impulse * nx; avy += impulse * ny;
   bvx -= impulse * nx; bvy -= impulse * ny;
@@ -818,6 +850,7 @@ function collideCars(a, b) {
   if (b.speed > 1) b.angle = Math.atan2(bvy, bvx);
   a.spinVel += (Math.random() - 0.5) * 3;
   b.spinVel += (Math.random() - 0.5) * 3;
+  return true;
 }
 
 // One-body collision — only push mine away from other (remote car)
@@ -1315,6 +1348,7 @@ function makeAICar(index) {
     cw, isAI: true, color: AI_COLORS[index],
     spinVel: 0, hitFlash: 0, hitCooldown: 0,
     isAggro: false, aggroTarget: null,
+    swerveTimer: 0, exploded: false, explodeTimer: 0,
     prevSector: getSector(s.x, s.y),
     nextSector: (getSector(s.x, s.y) + 1) % 4,
     sectorsPassed: 0, lap: 0, finished: false, finishTime: 0,
@@ -1337,11 +1371,22 @@ function getLeadPlayer() {
 }
 
 function updateAICar(car, dt) {
+  if (car.exploded) { car.explodeTimer = Math.max(0, car.explodeTimer - dt); return; }
   if (!raceGo) return;
   car.hitCooldown = Math.max(0, car.hitCooldown - dt);
   car.hitFlash = Math.max(0, car.hitFlash - dt);
   car.spinVel *= Math.exp(-SPIN_DECAY * dt);
   car.angle += car.spinVel * dt;
+
+  if (car.swerveTimer > 0) {
+    car.swerveTimer -= dt;
+    car.hitFlash = Math.max(car.hitFlash, 0.08); // keep faint flash while swerving
+    car.spinVel += (Math.random() - 0.5) * 22 * dt; // erratic spin
+    car.x += Math.cos(car.angle) * car.speed * dt;
+    car.y += Math.sin(car.angle) * car.speed * dt;
+    if (bounceOnWalls(car)) explodeAI(car);
+    return;
+  }
 
   const { tx, ty } = getTrackTangent(car.x, car.y, car.cw);
   let desired = Math.atan2(ty, tx);
@@ -1404,7 +1449,8 @@ function updateAggroState(dt) {
   if (aggroTimer <= 0) {
     aggroTimer = AI_AGGRO_INTERVAL;
     if (aggroCar) { aggroCar.isAggro = false; aggroCar.aggroTarget = null; }
-    aggroCar = aiCars.length ? aiCars[Math.floor(Math.random() * aiCars.length)] : null;
+    const alive = aiCars.filter(a => !a.exploded);
+    aggroCar = alive.length ? alive[Math.floor(Math.random() * alive.length)] : null;
     if (aggroCar) { aggroCar.isAggro = true; aggroCar.aggroTarget = getLeadPlayer(); }
   }
   if (aggroCar && aggroCar.isAggro) aggroCar.aggroTarget = getLeadPlayer();
@@ -1443,21 +1489,31 @@ function loop(ts) {
       if (myCarP2) collideCarOneWay(myCarP2, remCar);
     }
     for (const ai of aiCars) {
-      if (myCar)   collideCars(myCar, ai);
-      if (myCarP2) collideCars(myCarP2, ai);
+      if (ai.exploded) continue;
+      if (myCar   && collideCars(myCar,   ai) && ai.swerveTimer > 0) explodeAI(ai);
+      if (myCarP2 && collideCars(myCarP2, ai) && ai.swerveTimer > 0) explodeAI(ai);
     }
-    for (let i = 0; i < aiCars.length; i++)
-      for (let j = i + 1; j < aiCars.length; j++)
-        collideCars(aiCars[i], aiCars[j]);
+    for (let i = 0; i < aiCars.length; i++) {
+      if (aiCars[i].exploded) continue;
+      for (let j = i + 1; j < aiCars.length; j++) {
+        if (aiCars[j].exploded) continue;
+        if (collideCars(aiCars[i], aiCars[j])) {
+          if (aiCars[i].swerveTimer > 0) { explodeAI(aiCars[i]); explodeAI(aiCars[j]); }
+          else if (aiCars[j].swerveTimer > 0) { explodeAI(aiCars[j]); explodeAI(aiCars[i]); }
+        }
+      }
+    }
 
     // Bullet hit detection — remote bullets vs local cars
     if (myCar)   checkRemoteHits(myCar);
     if (myCarP2) checkRemoteHits(myCarP2);
-    // Local P1 bullets vs P2 and vice versa
+    // Local bullets vs P2/P1 and AI
     if (myCar && myCarP2) {
       checkLocalBulletHits(myCar.bullets, myCarP2);
       checkLocalBulletHits(myCarP2.bullets, myCar);
     }
+    if (myCar)   checkBulletsVsAI(myCar.bullets);
+    if (myCarP2) checkBulletsVsAI(myCarP2.bullets);
 
     // Broadcast (bullets as compact [x,y] pairs)
     if (myCar) {
@@ -1493,7 +1549,21 @@ function loop(ts) {
         }
       }
     }
-    for (const ai of aiCars) drawCar(ai, ai.isAggro ? 'AI!' : 'AI', false);
+    for (const ai of aiCars) {
+      if (ai.exploded) {
+        if (ai.explodeTimer > 0) {
+          const t = 1 - ai.explodeTimer / 0.7;
+          ctx.globalAlpha = ai.explodeTimer / 0.7;
+          ctx.beginPath();
+          ctx.arc(ai.x, ai.y, CAR_RADIUS * (1 + t * 3.5), 0, Math.PI * 2);
+          ctx.fillStyle = t < 0.5 ? '#ffee44' : '#ff6600';
+          ctx.fill();
+          ctx.globalAlpha = 1;
+        }
+      } else {
+        drawCar(ai, ai.isAggro ? 'AI!' : 'AI', false);
+      }
+    }
     if (myCarP2) { drawCar(myCarP2, 'P2', false); drawBullets(myCarP2.bullets, myCarP2.color); }
     if (myCar)   { drawCar(myCar,   'P1', true);  drawBullets(myCar.bullets,   myCar.color);   }
     drawHUD();
