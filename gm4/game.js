@@ -19,7 +19,7 @@ const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-h
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
 const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
-const VERSION = '2026-04-23-ab';
+const VERSION = '2026-04-23-ac';
 
 // AI car constants
 const AI_COUNT = 6;
@@ -843,8 +843,8 @@ function updateCarP2(car, dt) {
   if (keys['KeyA']) car.angle -= TURN_RATE * grip * dt;
   if (keys['KeyD']) car.angle += TURN_RATE * grip * dt;
 
-  // P2 fire — ShiftLeft, ControlLeft, or Tab
-  const p2Firing = keys['ShiftLeft'] || keys['ControlLeft'] || keys['Tab'];
+  // P2 fire — ShiftLeft, ControlLeft, Tab, or F
+  const p2Firing = keys['ShiftLeft'] || keys['ControlLeft'] || keys['Tab'] || keys['KeyF'];
   tryFire(car, p2Firing, dt);
   updateBullets(car.bullets, dt);
 
@@ -1129,38 +1129,56 @@ function drawLobby(dt) {
 // RENDERING — HUD
 // ============================================================
 function drawHUD() {
-  if (!myCar) return;
-
-  const displayLap = Math.min(myCar.lap + 1, TOTAL_LAPS);
-
-  // Lap box
-  ctx.fillStyle = 'rgba(0,0,0,0.65)';
-  ctx.fillRect(12, 12, 160, 62);
-  ctx.fillStyle = '#fff';
-  ctx.font = 'bold 22px monospace';
-  ctx.textAlign = 'left';
-  ctx.fillText('LAP ' + displayLap + ' / ' + TOTAL_LAPS, 22, 38);
-  ctx.font = '14px monospace';
-  ctx.fillStyle = '#aaa';
-  ctx.fillText(Math.round(Math.abs(myCar.speed)) + ' px/s', 22, 62);
-
-  // Position (P1 car's rank among all cars)
-  const allCars = [...remoteCars.values(),
-    { sectorsPassed: myCar.sectorsPassed, peerId: myPeerId },
-    ...(myCarP2 ? [{ sectorsPassed: myCarP2.sectorsPassed, peerId: myP2PeerId }] : [])
+  const allCars = [
+    ...remoteCars.values(),
+    ...(myCar   ? [{ sectorsPassed: myCar.sectorsPassed,   peerId: myPeerId   }] : []),
+    ...(myCarP2 ? [{ sectorsPassed: myCarP2.sectorsPassed, peerId: myP2PeerId }] : []),
   ];
   allCars.sort((a, b) => (b.sectorsPassed ?? 0) - (a.sectorsPassed ?? 0));
-  const pos = allCars.findIndex(c => c.peerId === myPeerId) + 1;
-  const sfx = ['st', 'nd', 'rd'];
-  const suf = sfx[pos - 1] || 'th';
-  ctx.fillStyle = 'rgba(0,0,0,0.65)';
-  ctx.fillRect(GW - 104, 12, 92, 62);
-  ctx.fillStyle = pos === 1 ? '#ffe030' : '#fff';
-  ctx.font = 'bold 36px monospace';
-  ctx.textAlign = 'right';
-  ctx.fillText(pos + suf, GW - 16, 56);
 
-  // Timer
+  function ordinal(n) {
+    return n + (['st', 'nd', 'rd'][n - 1] || 'th');
+  }
+
+  function drawPlayerBox(car, peerId, label, fireHint, alignRight) {
+    const W = 196, H = 76;
+    const x = alignRight ? GW - W - 12 : 12;
+    const y = 12;
+
+    ctx.fillStyle = 'rgba(0,0,0,0.68)';
+    ctx.fillRect(x, y, W, H);
+
+    // colour stripe on the inside edge
+    ctx.fillStyle = car.color;
+    ctx.fillRect(alignRight ? x : x + W - 5, y, 5, H);
+
+    const pos = allCars.findIndex(c => c.peerId === peerId) + 1;
+    const lap = Math.min(car.lap + 1, TOTAL_LAPS);
+
+    ctx.textAlign = alignRight ? 'right' : 'left';
+    const tx = alignRight ? x + W - 10 : x + 10;
+
+    ctx.fillStyle = '#888';
+    ctx.font = '12px monospace';
+    ctx.fillText(label + '  fire:' + fireHint, tx, y + 16);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('LAP ' + lap + ' / ' + TOTAL_LAPS, tx, y + 40);
+
+    ctx.fillStyle = '#aaa';
+    ctx.font = '13px monospace';
+    ctx.fillText(Math.round(Math.abs(car.speed)) + ' px/s', tx, y + 58);
+
+    ctx.fillStyle = pos === 1 ? '#ffe030' : '#ccc';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText(ordinal(pos), tx, y + 76);
+  }
+
+  if (myCar)   drawPlayerBox(myCar,   myPeerId,   'P1 ↑↓←→', '/',     false);
+  if (myCarP2) drawPlayerBox(myCarP2, myP2PeerId, 'P2 WASD',  'F/Tab', true);
+
+  // Timer — centre top
   const elapsed = (performance.now() - raceStartTime) / 1000;
   const mins = Math.floor(elapsed / 60);
   const secs = (elapsed % 60).toFixed(1).padStart(4, '0');
@@ -1171,16 +1189,14 @@ function drawHUD() {
   ctx.textAlign = 'center';
   ctx.fillText(mins + ':' + secs, GW / 2, 38);
 
-  // Pre-race countdown overlay (first 3s)
-  const sinceStart = (performance.now() - raceStartTime) / 1000;
-  if (sinceStart < 3.0) {
+  // Pre-race countdown overlay (first 3 s)
+  if (elapsed < 3.0) {
     ctx.fillStyle = 'rgba(0,0,0,0.55)';
     ctx.fillRect(0, 0, GW, GH);
-    const count = Math.ceil(3.0 - sinceStart);
     ctx.fillStyle = '#ffe030';
     ctx.font = 'bold 180px monospace';
     ctx.textAlign = 'center';
-    ctx.fillText(count, GW / 2, GH / 2 + 60);
+    ctx.fillText(Math.ceil(3.0 - elapsed), GW / 2, GH / 2 + 60);
     ctx.fillStyle = '#fff';
     ctx.font = 'bold 36px monospace';
     ctx.fillText('RACE IN...', GW / 2, GH / 2 - 60);
