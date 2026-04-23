@@ -19,16 +19,15 @@ const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-h
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
 const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
-const VERSION = '2026-04-23-ae';
+const VERSION = '2026-04-23-ag';
 
 // AI car constants
-const AI_COUNT = 6;
+const AI_COUNT = 30;
 const AI_SPEED = 255;
 const AI_ACCEL = 380;
 const AI_TURN_RATE = 2.0;
 const AI_AVOID_RADIUS = 55;
 const AI_AGGRO_INTERVAL = 15;
-const AI_COLORS = ['#e06060', '#60c0a0', '#60a0d0', '#80c880', '#c0b040', '#b060c0'];
 
 // Car constants
 const CAR_L = 26, CAR_W = 13;
@@ -41,7 +40,7 @@ const FRICTION_K = 1.8;  // speed decay: speed *= e^(-FRICTION_K * dt)
 // Weapons & collisions
 const BULLET_SPEED = 660;
 const BULLET_LIFE = 1.4;   // seconds (travels ~924px)
-const FIRE_RATE = 0.09;    // seconds between shots (~11/s)
+const FIRE_RATE = 0.1;     // seconds per charge chunk (~10/s)
 const HIT_RADIUS = 15;     // px, bullet detection range
 const HIT_COOLDOWN = 0.4;  // s invincibility after hit
 const HIT_SPIN = 2.5;      // rad/s spin magnitude from bullet hit
@@ -50,6 +49,15 @@ const HIT_FLASH_DUR = 0.4;
 const SPIN_DECAY = 3.0;    // rad/s² decay rate
 const AI_SWERVE_DURATION = 1.0; // s AI swerves after being shot
 const WALL_BOUNCE = 0.62;  // speed retained on wall bounce
+
+// Ammo & oil
+const RECHARGE_TIME = 5.0;  // s per charge slot to recharge
+const MAX_CHARGES = 30;     // 30 × 0.1 s = 3 s total fire; each slot replenishes in 5 s
+const OIL_FIRE_RATE = 0.1;  // s between oil drops (one chunk)
+const OIL_LIFE = 1.0;       // s oil slick lingers on track
+const OIL_SKID_DURATION = 1.0; // s car skids after touching oil
+const OIL_RADIUS = 22;      // px
+const SKID_LIFE = 4.0;      // s skid marks persist
 const CAR_BOUNCE = 0.72;   // speed retained on car-car collision
 const CAR_RADIUS = 16;     // px, collision circle radius per car
 
@@ -92,6 +100,10 @@ let aiCars = [];
 let aggroTimer = AI_AGGRO_INTERVAL;
 let aggroCar = null;
 
+// World effects
+let oilSlicks = [];   // { x, y, life, angle }
+let skidMarks = [];   // { x, y, life }
+
 // Input
 const keys = {};
 document.addEventListener('keydown', e => {
@@ -107,6 +119,9 @@ document.addEventListener('keydown', e => {
   }
   if (e.code === 'KeyW' && (lobbyState === 'lobby' || lobbyState === 'countdown')) onFlapDownP2();
   if (e.code === 'Tab') e.preventDefault(); // no focus escape during play
+  if ((e.code === 'Comma' || e.code === 'Period' || e.code === 'Enter' ||
+       e.code === 'BracketLeft' || e.code === 'BracketRight' || e.code === 'Backquote' ||
+       e.code === 'KeyC' || e.code === 'KeyV' || e.code === 'Digit1') && lobbyState === 'game') e.preventDefault();
 });
 document.addEventListener('keyup', e => {
   keys[e.code] = false;
@@ -518,6 +533,30 @@ function handleMsg(from, data) {
         finishOrder.push({ peerId: data.peerId, time: data.time });
       }
       break;
+
+    case 'ai-swerve': {
+      const ai = aiCars[data.idx];
+      if (ai && !ai.exploded && ai.hitCooldown <= 0) {
+        ai.hitCooldown = HIT_COOLDOWN;
+        ai.swerveTimer = AI_SWERVE_DURATION;
+        ai.hitFlash = HIT_FLASH_DUR;
+        ai.spinVel += (data.spinDir || 1) * HIT_SPIN * 2;
+      }
+      break;
+    }
+
+    case 'ai-explode': {
+      const ai = aiCars[data.idx];
+      if (ai && !ai.exploded) {
+        ai.exploded = true; ai.finished = true;
+        ai.speed = 0; ai.swerveTimer = 0; ai.explodeTimer = 0.7;
+      }
+      break;
+    }
+
+    case 'oil-place':
+      oilSlicks.push({ x: data.x, y: data.y, life: OIL_LIFE, angle: data.angle || 0 });
+      break;
   }
 }
 
@@ -644,8 +683,12 @@ function makeCar(slotIndex, posIndex) {
     spinVel: 0,
     hitFlash: 0,
     hitCooldown: 0,
+    skidTimer: 0,
     fireTimer: 0,
     bullets: [],   // own fired bullets
+    gunCharges: new Array(MAX_CHARGES).fill(0),   // 0 = ready, >0 = recharging
+    oilCharges: new Array(MAX_CHARGES).fill(0),
+    oilFireTimer: 0,
   };
 }
 
@@ -657,6 +700,8 @@ function startGame(msg) {
   goFlashTimer = 0;
   finishOrder = [];
   remoteCars.clear();
+  oilSlicks = [];
+  skidMarks = [];
 
   const playerSlots = msg.playerSlots || [];
   console.log('[game] startGame playerSlots:', JSON.stringify(playerSlots), 'myPeerId:', myPeerId, 'myP2PeerId:', myP2PeerId);
@@ -682,6 +727,7 @@ function startGame(msg) {
 function updateCar(car, dt) {
   car.hitCooldown = Math.max(0, car.hitCooldown - dt);
   car.hitFlash    = Math.max(0, car.hitFlash - dt);
+  car.skidTimer   = Math.max(0, car.skidTimer - dt);
   car.spinVel    *= Math.exp(-SPIN_DECAY * dt);
   car.angle      += car.spinVel * dt;
 
@@ -698,18 +744,32 @@ function updateCar(car, dt) {
   }
 
   const grip = Math.abs(car.speed) / MAX_SPEED;
-  if (keys['ArrowLeft'])  car.angle -= TURN_RATE * grip * dt;
-  if (keys['ArrowRight']) car.angle += TURN_RATE * grip * dt;
+  if (car.skidTimer > 0) {
+    // Oil skid — reduced steering, random wobble, leave skid marks
+    if (keys['ArrowLeft'])  car.angle -= TURN_RATE * grip * 0.3 * dt;
+    if (keys['ArrowRight']) car.angle += TURN_RATE * grip * 0.3 * dt;
+    car.spinVel += (Math.random() - 0.5) * 10 * dt;
+    if (Math.random() < dt * 25) skidMarks.push({ x: car.x, y: car.y, life: SKID_LIFE });
+  } else {
+    if (keys['ArrowLeft'])  car.angle -= TURN_RATE * grip * dt;
+    if (keys['ArrowRight']) car.angle += TURN_RATE * grip * dt;
+  }
 
-  // P1 fire — ShiftRight, ControlRight, or Slash
-  const p1Firing = keys['ShiftRight'] || keys['ControlRight'] || keys['Slash'];
+  // P1 fire gun — ShiftRight, ControlRight, Slash, Comma, BracketLeft
+  const p1Firing = keys['ShiftRight'] || keys['ControlRight'] || keys['Slash'] || keys['Comma'] || keys['BracketLeft'];
   tryFire(car, p1Firing, dt);
+  // P1 oil — Period, Enter, BracketRight
+  tryOil(car, keys['Period'] || keys['Enter'] || keys['BracketRight'], dt);
   updateBullets(car.bullets, dt);
 
   car.x += Math.cos(car.angle) * car.speed * dt;
   car.y += Math.sin(car.angle) * car.speed * dt;
 
   bounceOnWalls(car);
+
+  if (car.hitFlash > 0 && Math.random() < dt * 20) {
+    skidMarks.push({ x: car.x, y: car.y, life: SKID_LIFE });
+  }
 
   // Lap counting via sector transitions
   const sector = getSector(car.x, car.y);
@@ -748,21 +808,26 @@ function applyHit(car) {
   car.hitFlash = HIT_FLASH_DUR;
 }
 
-function applyHitAI(car) {
+function applyHitAI(car, net) {
   if (car.hitCooldown > 0 || car.exploded) return;
+  const idx = aiCars.indexOf(car);
+  const spinDir = Math.random() < 0.5 ? 1 : -1;
   car.hitCooldown = HIT_COOLDOWN;
   car.swerveTimer = AI_SWERVE_DURATION;
   car.hitFlash = HIT_FLASH_DUR;
-  car.spinVel += (Math.random() < 0.5 ? 1 : -1) * HIT_SPIN * 2;
+  car.spinVel += spinDir * HIT_SPIN * 2;
+  if (net && idx >= 0) broadcast({ type: 'ai-swerve', idx, spinDir });
 }
 
-function explodeAI(car) {
+function explodeAI(car, net) {
   if (car.exploded) return;
+  const idx = aiCars.indexOf(car);
   car.exploded = true;
   car.finished = true;
   car.speed = 0;
   car.swerveTimer = 0;
   car.explodeTimer = 0.7;
+  if (net && idx >= 0) broadcast({ type: 'ai-explode', idx });
 }
 
 function checkBulletsVsAI(bullets) {
@@ -771,16 +836,31 @@ function checkBulletsVsAI(bullets) {
     for (const b of bullets) {
       const dx = b.x - ai.x, dy = b.y - ai.y;
       if (dx * dx + dy * dy < HIT_RADIUS * HIT_RADIUS) {
-        applyHitAI(ai);
+        applyHitAI(ai, true);
         break;
       }
     }
   }
 }
 
+function consumeCharge(charges) {
+  const i = charges.findIndex(t => t === 0);
+  if (i < 0) return false;
+  charges[i] = RECHARGE_TIME;
+  return true;
+}
+
+function updateCharges(charges, dt) {
+  for (let i = 0; i < charges.length; i++) {
+    if (charges[i] > 0) charges[i] = Math.max(0, charges[i] - dt);
+  }
+}
+
 function tryFire(car, firing, dt) {
+  if (car.gunCharges) updateCharges(car.gunCharges, dt);
   car.fireTimer = Math.max(0, car.fireTimer - dt);
   if (!firing || car.finished || car.fireTimer > 0) return;
+  if (car.gunCharges && !consumeCharge(car.gunCharges)) return;
   car.fireTimer = FIRE_RATE;
   const bvx = Math.cos(car.angle) * (BULLET_SPEED + Math.abs(car.speed));
   const bvy = Math.sin(car.angle) * (BULLET_SPEED + Math.abs(car.speed));
@@ -789,6 +869,53 @@ function tryFire(car, firing, dt) {
     y: car.y + Math.sin(car.angle) * (CAR_L / 2 + 5),
     vx: bvx, vy: bvy, life: BULLET_LIFE
   });
+}
+
+function tryOil(car, firing, dt) {
+  if (car.oilCharges) updateCharges(car.oilCharges, dt);
+  car.oilFireTimer = Math.max(0, car.oilFireTimer - dt);
+  if (!firing || car.finished || car.oilFireTimer > 0) return;
+  if (!consumeCharge(car.oilCharges)) return;
+  car.oilFireTimer = OIL_FIRE_RATE;
+  const bx = car.x - Math.cos(car.angle) * (CAR_L / 2 + 8);
+  const by = car.y - Math.sin(car.angle) * (CAR_L / 2 + 8);
+  placeOilSlick(bx, by, car.angle, true);
+}
+
+function placeOilSlick(x, y, angle, net) {
+  oilSlicks.push({ x, y, life: OIL_LIFE, angle });
+  if (net) broadcast({ type: 'oil-place', x: Math.round(x), y: Math.round(y), angle });
+}
+
+function checkOilSlicks(dt) {
+  for (let i = oilSlicks.length - 1; i >= 0; i--) {
+    const o = oilSlicks[i];
+    o.life -= dt;
+    if (o.life <= 0) { oilSlicks.splice(i, 1); continue; }
+    for (const ai of aiCars) {
+      if (ai.exploded) continue;
+      const dx = ai.x - o.x, dy = ai.y - o.y;
+      if (dx * dx + dy * dy < OIL_RADIUS * OIL_RADIUS) {
+        // Oil causes AI to swerve; if they then hit anything they explode
+        ai.swerveTimer = Math.max(ai.swerveTimer, OIL_SKID_DURATION);
+        ai.hitFlash = Math.max(ai.hitFlash, 0.2);
+      }
+    }
+    if (myCar && !myCar.finished) {
+      const dx = myCar.x - o.x, dy = myCar.y - o.y;
+      if (dx * dx + dy * dy < OIL_RADIUS * OIL_RADIUS) {
+        myCar.skidTimer = Math.max(myCar.skidTimer, OIL_SKID_DURATION);
+        myCar.hitFlash = Math.max(myCar.hitFlash, 0.2);
+      }
+    }
+    if (myCarP2 && !myCarP2.finished) {
+      const dx = myCarP2.x - o.x, dy = myCarP2.y - o.y;
+      if (dx * dx + dy * dy < OIL_RADIUS * OIL_RADIUS) {
+        myCarP2.skidTimer = Math.max(myCarP2.skidTimer, OIL_SKID_DURATION);
+        myCarP2.hitFlash = Math.max(myCarP2.hitFlash, 0.2);
+      }
+    }
+  }
 }
 
 function updateBullets(bullets, dt) {
@@ -879,6 +1006,7 @@ function collideCarOneWay(mine, other) {
 function updateCarP2(car, dt) {
   car.hitCooldown = Math.max(0, car.hitCooldown - dt);
   car.hitFlash    = Math.max(0, car.hitFlash - dt);
+  car.skidTimer   = Math.max(0, car.skidTimer - dt);
   car.spinVel    *= Math.exp(-SPIN_DECAY * dt);
   car.angle      += car.spinVel * dt;
 
@@ -895,17 +1023,32 @@ function updateCarP2(car, dt) {
   }
 
   const grip = Math.abs(car.speed) / MAX_SPEED;
-  if (keys['KeyA']) car.angle -= TURN_RATE * grip * dt;
-  if (keys['KeyD']) car.angle += TURN_RATE * grip * dt;
+  if (car.skidTimer > 0) {
+    // Oil skid — reduced steering, random wobble, leave skid marks
+    if (keys['KeyA']) car.angle -= TURN_RATE * grip * 0.3 * dt;
+    if (keys['KeyD']) car.angle += TURN_RATE * grip * 0.3 * dt;
+    car.spinVel += (Math.random() - 0.5) * 10 * dt;
+    if (Math.random() < dt * 25) skidMarks.push({ x: car.x, y: car.y, life: SKID_LIFE });
+  } else {
+    if (keys['KeyA']) car.angle -= TURN_RATE * grip * dt;
+    if (keys['KeyD']) car.angle += TURN_RATE * grip * dt;
+  }
 
-  // P2 fire — ShiftLeft, ControlLeft, Tab, or F
-  const p2Firing = keys['ShiftLeft'] || keys['ControlLeft'] || keys['Tab'] || keys['KeyF'];
+  // P2 fire gun — ShiftLeft, ControlLeft, Tab, F, Q, Backquote (`), C
+  const p2Firing = keys['ShiftLeft'] || keys['ControlLeft'] || keys['Tab'] ||
+                   keys['KeyF'] || keys['KeyQ'] || keys['Backquote'] || keys['KeyC'];
   tryFire(car, p2Firing, dt);
+  // P2 oil — E, Digit1 (1), V
+  tryOil(car, keys['KeyE'] || keys['Digit1'] || keys['KeyV'], dt);
   updateBullets(car.bullets, dt);
 
   car.x += Math.cos(car.angle) * car.speed * dt;
   car.y += Math.sin(car.angle) * car.speed * dt;
   bounceOnWalls(car);
+
+  if (car.hitFlash > 0 && Math.random() < dt * 20) {
+    skidMarks.push({ x: car.x, y: car.y, life: SKID_LIFE });
+  }
 
   const sector = getSector(car.x, car.y);
   if (sector !== car.prevSector && sector === car.nextSector) {
@@ -1052,6 +1195,42 @@ function drawBullets(bullets, color) {
   ctx.globalAlpha = 1;
 }
 
+function drawSkidMarks() {
+  for (const s of skidMarks) {
+    ctx.globalAlpha = (s.life / SKID_LIFE) * 0.55;
+    ctx.fillStyle = '#777';
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawOilSlicks() {
+  for (const o of oilSlicks) {
+    const fade = o.life / OIL_LIFE;
+    ctx.globalAlpha = Math.min(fade * 3, 1) * 0.88;
+    ctx.save();
+    ctx.translate(o.x, o.y);
+    ctx.rotate(o.angle || 0);
+    // Black streak mark on road
+    ctx.fillStyle = '#050505';
+    ctx.fillRect(-20, -6, 40, 12);
+    ctx.fillStyle = 'rgba(20,20,50,0.55)';
+    ctx.fillRect(-14, -4, 28, 8);
+    ctx.restore();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawAmmoRow(charges, bx, by, bw, bh, readyColor) {
+  const segW = bw / MAX_CHARGES;
+  for (let i = 0; i < MAX_CHARGES; i++) {
+    ctx.fillStyle = charges[i] === 0 ? readyColor : '#252525';
+    ctx.fillRect(bx + i * segW + 1, by, segW - 2, bh);
+  }
+}
+
 // ============================================================
 // RENDERING — LOBBY
 // ============================================================
@@ -1195,8 +1374,8 @@ function drawHUD() {
     return n + (['st', 'nd', 'rd'][n - 1] || 'th');
   }
 
-  function drawPlayerBox(car, peerId, label, fireHint, alignRight) {
-    const W = 196, H = 76;
+  function drawPlayerBox(car, peerId, label, gunHint, oilHint, alignRight) {
+    const W = 196, H = 110;
     const x = alignRight ? GW - W - 12 : 12;
     const y = 12;
 
@@ -1214,24 +1393,33 @@ function drawHUD() {
     const tx = alignRight ? x + W - 10 : x + 10;
 
     ctx.fillStyle = '#888';
-    ctx.font = '12px monospace';
-    ctx.fillText(label + '  fire:' + fireHint, tx, y + 16);
+    ctx.font = '11px monospace';
+    ctx.fillText(label, tx, y + 16);
+
+    ctx.fillStyle = '#555';
+    ctx.font = '9px monospace';
+    ctx.fillText('gun:' + gunHint + '  oil:' + oilHint, tx, y + 29);
 
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 20px monospace';
-    ctx.fillText('LAP ' + lap + ' / ' + TOTAL_LAPS, tx, y + 40);
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText('LAP ' + lap + ' / ' + TOTAL_LAPS, tx, y + 50);
 
     ctx.fillStyle = '#aaa';
-    ctx.font = '13px monospace';
-    ctx.fillText(Math.round(Math.abs(car.speed)) + ' px/s', tx, y + 58);
+    ctx.font = '12px monospace';
+    ctx.fillText(Math.round(Math.abs(car.speed)) + ' px/s', tx, y + 65);
 
     ctx.fillStyle = pos === 1 ? '#ffe030' : '#ccc';
-    ctx.font = 'bold 20px monospace';
-    ctx.fillText(ordinal(pos), tx, y + 76);
+    ctx.font = 'bold 18px monospace';
+    ctx.fillText(ordinal(pos), tx, y + 83);
+
+    // Ammo bars
+    const barsX = x + 7, barsW = W - 14;
+    if (car.gunCharges) drawAmmoRow(car.gunCharges, barsX, y + 89, barsW, 7, '#ff7700');
+    if (car.oilCharges) drawAmmoRow(car.oilCharges, barsX, y + 100, barsW, 7, '#22aa44');
   }
 
-  if (myCar)   drawPlayerBox(myCar,   myPeerId,   'P1 ↑↓←→', '/',     false);
-  if (myCarP2) drawPlayerBox(myCarP2, myP2PeerId, 'P2 WASD',  'F/Tab', true);
+  if (myCar)   drawPlayerBox(myCar,   myPeerId,   'P1 ↑↓←→', '/,[',  '.↵]', false);
+  if (myCarP2) drawPlayerBox(myCarP2, myP2PeerId, 'P2 WASD',  'Q`C',  'E1V', true);
 
   // Timer — centre top
   const elapsed = (performance.now() - raceStartTime) / 1000;
@@ -1331,21 +1519,54 @@ function getTrackTangent(px, py, cw) {
   return cw ? { tx: -ny, ty: nx } : { tx: ny, ty: -nx };
 }
 
+// 30 spawn positions spread around the track, all facing clockwise
+const AI_STARTS = [
+  // Top straight outer lane (going east)
+  { x: 200, y: 130, a: 0 },
+  { x: 300, y: 130, a: 0 },
+  { x: 400, y: 130, a: 0 },
+  { x: 500, y: 130, a: 0 },
+  { x: 600, y: 130, a: 0 },
+  { x: 700, y: 130, a: 0 },
+  // Top straight inner lane (going east)
+  { x: 200, y: 215, a: 0 },
+  { x: 350, y: 215, a: 0 },
+  { x: 500, y: 215, a: 0 },
+  { x: 650, y: 215, a: 0 },
+  // Right hairpin (going clockwise around the curve)
+  { x: 1010, y: 187, a: Math.PI / 6 },
+  { x: 1110, y: 360, a: Math.PI / 2 },
+  { x: 1010, y: 533, a: 5 * Math.PI / 6 },
+  { x: 1070, y: 250, a: Math.PI / 3 },
+  { x: 1070, y: 470, a: 2 * Math.PI / 3 },
+  // Bottom straight outer lane (going west)
+  { x: 800, y: 590, a: Math.PI },
+  { x: 700, y: 590, a: Math.PI },
+  { x: 600, y: 590, a: Math.PI },
+  { x: 500, y: 590, a: Math.PI },
+  { x: 400, y: 590, a: Math.PI },
+  { x: 300, y: 590, a: Math.PI },
+  // Bottom straight inner lane (going west)
+  { x: 800, y: 500, a: Math.PI },
+  { x: 650, y: 500, a: Math.PI },
+  { x: 500, y: 500, a: Math.PI },
+  { x: 350, y: 500, a: Math.PI },
+  // Left section (going north)
+  { x: 175, y: 560, a: -Math.PI / 2 },
+  { x: 175, y: 460, a: -Math.PI / 2 },
+  { x: 175, y: 360, a: -Math.PI / 2 },
+  { x: 255, y: 500, a: -Math.PI / 2 },
+  { x: 255, y: 400, a: -Math.PI / 2 },
+];
+
 function makeAICar(index) {
-  const cw = index < 3;
-  const starts = [
-    { x: 720, y: 120, a: 0 },              // CW 0: top straight, outer lane
-    { x: 460, y: 600, a: Math.PI },         // CW 1: bottom straight, outer lane
-    { x: 1150, y: 300, a: Math.PI / 2 },    // CW 2: right hairpin, outer lane
-    { x: 440, y: 200, a: Math.PI },         // CCW 3: top straight, inner lane
-    { x: 720, y: 520, a: 0 },              // CCW 4: bottom straight, inner lane
-    { x: 1070, y: 420, a: -Math.PI / 2 },   // CCW 5: right hairpin, inner lane
-  ];
-  const s = starts[index];
+  const s = AI_STARTS[index % AI_STARTS.length];
   return {
     x: s.x, y: s.y, angle: s.a,
     speed: AI_SPEED * 0.6,
-    cw, isAI: true, color: AI_COLORS[index],
+    cw: true, isAI: true,
+    color: '#ffffff',
+    laneTarget: index % 2 === 0 ? -50 : -130,
     spinVel: 0, hitFlash: 0, hitCooldown: 0,
     isAggro: false, aggroTarget: null,
     swerveTimer: 0, exploded: false, explodeTimer: 0,
@@ -1384,7 +1605,8 @@ function updateAICar(car, dt) {
     car.spinVel += (Math.random() - 0.5) * 22 * dt; // erratic spin
     car.x += Math.cos(car.angle) * car.speed * dt;
     car.y += Math.sin(car.angle) * car.speed * dt;
-    if (bounceOnWalls(car)) explodeAI(car);
+    if (Math.random() < dt * 20) skidMarks.push({ x: car.x, y: car.y, life: SKID_LIFE });
+    if (bounceOnWalls(car)) explodeAI(car, true);
     return;
   }
 
@@ -1414,7 +1636,7 @@ function updateAICar(car, dt) {
   if (avoidMag > 0.05)
     desired = lerpAngle(desired, Math.atan2(ay, ax), Math.min(avoidMag * 0.7, 0.6));
 
-  const laneTarget = car.cw ? -50 : -130;
+  const laneTarget = car.laneTarget ?? -50;
   const od = sdfOuter(car.x, car.y);
   const laneErr = od - laneTarget;
   if (Math.abs(laneErr) > 8) {
@@ -1490,16 +1712,16 @@ function loop(ts) {
     }
     for (const ai of aiCars) {
       if (ai.exploded) continue;
-      if (myCar   && collideCars(myCar,   ai) && ai.swerveTimer > 0) explodeAI(ai);
-      if (myCarP2 && collideCars(myCarP2, ai) && ai.swerveTimer > 0) explodeAI(ai);
+      if (myCar   && collideCars(myCar,   ai) && ai.swerveTimer > 0) explodeAI(ai, true);
+      if (myCarP2 && collideCars(myCarP2, ai) && ai.swerveTimer > 0) explodeAI(ai, true);
     }
     for (let i = 0; i < aiCars.length; i++) {
       if (aiCars[i].exploded) continue;
       for (let j = i + 1; j < aiCars.length; j++) {
         if (aiCars[j].exploded) continue;
         if (collideCars(aiCars[i], aiCars[j])) {
-          if (aiCars[i].swerveTimer > 0) { explodeAI(aiCars[i]); explodeAI(aiCars[j]); }
-          else if (aiCars[j].swerveTimer > 0) { explodeAI(aiCars[j]); explodeAI(aiCars[i]); }
+          if (aiCars[i].swerveTimer > 0) { explodeAI(aiCars[i], true); explodeAI(aiCars[j], true); }
+          else if (aiCars[j].swerveTimer > 0) { explodeAI(aiCars[j], true); explodeAI(aiCars[i], true); }
         }
       }
     }
@@ -1514,6 +1736,13 @@ function loop(ts) {
     }
     if (myCar)   checkBulletsVsAI(myCar.bullets);
     if (myCarP2) checkBulletsVsAI(myCarP2.bullets);
+
+    // Oil slicks & skid mark aging
+    checkOilSlicks(dt);
+    for (let i = skidMarks.length - 1; i >= 0; i--) {
+      skidMarks[i].life -= dt;
+      if (skidMarks[i].life <= 0) skidMarks.splice(i, 1);
+    }
 
     // Broadcast (bullets as compact [x,y] pairs)
     if (myCar) {
@@ -1537,6 +1766,8 @@ function loop(ts) {
 
     // Render
     drawTrack();
+    drawSkidMarks();
+    drawOilSlicks();
     for (const [pid, car] of remoteCars) {
       if (car) {
         drawCar(car, pid.slice(0, 5), false);
