@@ -19,7 +19,7 @@ const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-h
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
 const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
-const VERSION = '2026-04-23-aa';
+const VERSION = '2026-04-23-ab';
 
 // AI car constants
 const AI_COUNT = 6;
@@ -393,9 +393,18 @@ function broadcast(msg) {
 function handleMsg(from, data) {
   switch (data.type) {
 
-    case 'lobby-sync':
+    case 'lobby-sync': {
+      let p1Yielded = false, p2Yielded = false;
       data.slots.forEach(s => {
         if (s.peerId && s.peerId !== myPeerId && s.peerId !== myP2PeerId) {
+          if (mySlotIndex === s.index && myPeerId > s.peerId) {
+            slots[mySlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
+            mySlotIndex = -1; p1Yielded = true;
+          }
+          if (myP2SlotIndex === s.index && myP2PeerId > s.peerId) {
+            slots[myP2SlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
+            myP2SlotIndex = -1; p2Yielded = true;
+          }
           slots[s.index].peerId = s.peerId;
           slots[s.index].ready = s.ready;
           slots[s.index].progress = s.progress;
@@ -406,10 +415,29 @@ function handleMsg(from, data) {
         countdownTimer = data.countdownTimer ?? COUNTDOWN_DURATION;
       }
       updateHost();
+      if (p1Yielded) claimSlot();
+      if (p2Yielded) claimSlotP2();
       break;
+    }
 
     case 'lobby-join':
-      if (data.peerId !== myPeerId) {
+      if (data.peerId !== myPeerId && data.peerId !== myP2PeerId) {
+        if (mySlotIndex === data.slotIndex && myPeerId > data.peerId) {
+          slots[mySlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
+          mySlotIndex = -1;
+          slots[data.slotIndex].peerId = data.peerId;
+          updateHost();
+          claimSlot();
+          break;
+        }
+        if (myP2SlotIndex === data.slotIndex && myP2PeerId > data.peerId) {
+          slots[myP2SlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
+          myP2SlotIndex = -1;
+          slots[data.slotIndex].peerId = data.peerId;
+          updateHost();
+          claimSlotP2();
+          break;
+        }
         slots[data.slotIndex].peerId = data.peerId;
         updateHost();
       }
