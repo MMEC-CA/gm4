@@ -19,7 +19,7 @@ const O_HW = 560, O_HH = 290, O_R = 145;   // outer boundary: half-width, half-h
 const I_HW = 310, I_HH = 110, I_R = 70;    // inner island:   half-width, half-height, corner-radius
 const SC_X = TCX + O_HW - O_HH;            // right semicircle centre x (both outer & inner share it)
 
-const VERSION = '2026-04-23-ac';
+const VERSION = '2026-04-23-ad';
 
 // AI car constants
 const AI_COUNT = 6;
@@ -278,18 +278,23 @@ function connect(room) {
   const url = room
     ? `${SIGNALING_URL}?room=${encodeURIComponent(room)}&peerId=${myPeerId}`
     : `${SIGNALING_URL}?peerId=${myPeerId}`;
+  console.log('[sig] connecting as', myPeerId);
   sigWs = new WebSocket(url);
+  sigWs.onopen  = () => console.log('[sig] connected');
   sigWs.onmessage = onSigMsg;
-  sigWs.onclose = () => { };
+  sigWs.onclose = () => console.log('[sig] disconnected');
 }
 
 function onSigMsg(ev) {
   const data = JSON.parse(ev.data);
   if (data.type === 'peers') {
+    console.log('[sig] room peers:', data.peers);
     data.peers.forEach(id => { if (id !== myPeerId && !pcs.has(id) && myPeerId < id) createPc(id, true); });
   } else if (data.type === 'peer-joined') {
+    console.log('[sig] peer-joined:', data.peerId, '— initiating:', myPeerId < data.peerId);
     if (data.peerId !== myPeerId && !pcs.has(data.peerId) && myPeerId < data.peerId) createPc(data.peerId, true);
   } else if (data.type === 'peer-left') {
+    console.log('[sig] peer-left:', data.peerId);
     cleanupPeer(data.peerId);
   } else if (data.type === 'signal') {
     handleSignal(data.from, data.signal);
@@ -314,6 +319,7 @@ function createPc(peerId, initiator) {
   dcs.set(peerId, dc);
 
   dc.onopen = () => {
+    console.log('[rtc] data channel open with', peerId);
     dc.send(JSON.stringify({
       type: 'lobby-sync',
       slots: slots.map((s, i) => ({ ...s, index: i })),
@@ -396,19 +402,28 @@ function handleMsg(from, data) {
     case 'lobby-sync': {
       let p1Yielded = false, p2Yielded = false;
       data.slots.forEach(s => {
-        if (s.peerId && s.peerId !== myPeerId && s.peerId !== myP2PeerId) {
-          if (mySlotIndex === s.index && myPeerId > s.peerId) {
+        if (!s.peerId || s.peerId === myPeerId || s.peerId === myP2PeerId) return;
+        if (mySlotIndex === s.index) {
+          if (myPeerId > s.peerId) {
+            console.log('[slot] sync: yielding slot', s.index, 'to', s.peerId);
             slots[mySlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
             mySlotIndex = -1; p1Yielded = true;
+          } else {
+            return; // we won this slot — don't overwrite
           }
-          if (myP2SlotIndex === s.index && myP2PeerId > s.peerId) {
+        }
+        if (myP2SlotIndex === s.index) {
+          if (myP2PeerId > s.peerId) {
+            console.log('[slot] sync: P2 yielding slot', s.index, 'to', s.peerId);
             slots[myP2SlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
             myP2SlotIndex = -1; p2Yielded = true;
+          } else {
+            return; // we won this slot — don't overwrite
           }
-          slots[s.index].peerId = s.peerId;
-          slots[s.index].ready = s.ready;
-          slots[s.index].progress = s.progress;
         }
+        slots[s.index].peerId = s.peerId;
+        slots[s.index].ready = s.ready;
+        slots[s.index].progress = s.progress;
       });
       if (data.lobbyState === 'countdown' && lobbyState === 'lobby') {
         lobbyState = 'countdown';
@@ -422,20 +437,26 @@ function handleMsg(from, data) {
 
     case 'lobby-join':
       if (data.peerId !== myPeerId && data.peerId !== myP2PeerId) {
-        if (mySlotIndex === data.slotIndex && myPeerId > data.peerId) {
-          slots[mySlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
-          mySlotIndex = -1;
-          slots[data.slotIndex].peerId = data.peerId;
-          updateHost();
-          claimSlot();
+        if (mySlotIndex === data.slotIndex) {
+          if (myPeerId > data.peerId) {
+            console.log('[slot] join: yielding slot', data.slotIndex, 'to', data.peerId);
+            slots[mySlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
+            mySlotIndex = -1;
+            slots[data.slotIndex].peerId = data.peerId;
+            updateHost();
+            claimSlot();
+          } // else we won — ignore, keep our slot
           break;
         }
-        if (myP2SlotIndex === data.slotIndex && myP2PeerId > data.peerId) {
-          slots[myP2SlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
-          myP2SlotIndex = -1;
-          slots[data.slotIndex].peerId = data.peerId;
-          updateHost();
-          claimSlotP2();
+        if (myP2SlotIndex === data.slotIndex) {
+          if (myP2PeerId > data.peerId) {
+            console.log('[slot] join: P2 yielding slot', data.slotIndex, 'to', data.peerId);
+            slots[myP2SlotIndex] = { peerId: null, ready: false, progress: 0, holding: false };
+            myP2SlotIndex = -1;
+            slots[data.slotIndex].peerId = data.peerId;
+            updateHost();
+            claimSlotP2();
+          } // else we won — ignore
           break;
         }
         slots[data.slotIndex].peerId = data.peerId;
@@ -636,6 +657,7 @@ function startGame(msg) {
   remoteCars.clear();
 
   const playerSlots = msg.playerSlots || [];
+  console.log('[game] startGame playerSlots:', JSON.stringify(playerSlots), 'myPeerId:', myPeerId, 'myP2PeerId:', myP2PeerId);
   const myEntry = playerSlots.find(ps => ps.peerId === myPeerId);
   if (myEntry) {
     myCar = makeCar(myEntry.slotIndex, playerSlots.indexOf(myEntry));
